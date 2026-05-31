@@ -5,10 +5,16 @@ description = "Lode: fully local repository knowledge graph daemon and CLI."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
-authors = [
-  { name = "Bryan" }
+authors = [{ name = "Bryan" }]
+keywords = [
+  "code-intelligence",
+  "knowledge-graph",
+  "kuzu",
+  "sqlite",
+  "cli",
+  "agents",
+  "lode",
 ]
-keywords = ["code-intelligence", "knowledge-graph", "kuzu", "sqlite", "cli", "agents", "lode"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -16,9 +22,14 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
-  "Topic :: Software Development :: Libraries :: Python Modules"
+  "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/alfredosdpiii/lode"
+Repository = "https://github.com/alfredosdpiii/lode"
+Issues = "https://github.com/alfredosdpiii/lode/issues"
 
 [project.optional-dependencies]
 kuzu = ["kuzu>=0.11.0"]
@@ -39,4 +50,3 @@ package = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lode"]
-

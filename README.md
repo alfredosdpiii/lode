@@ -25,19 +25,33 @@ This is an early open-source MVP. It currently provides:
 - Optional Kuzu projection code when the `kuzu` extra is installed.
 - Docker Compose with a local TEI embeddings service using `Snowflake/snowflake-arctic-embed-s`.
 
+## Install
+
+The PyPI package is `lode-kg`; it installs the `lode` CLI and `loded` daemon commands.
+
+```bash
+uv tool install lode-kg
+lode --help
+```
+
+Or install with the optional embedded Kuzu projection support:
+
+```bash
+uv tool install 'lode-kg[kuzu]'
+```
+
 ## Quick start
 
 ```bash
-cd ~/Projects/lode
-uv run lode index ~/Projects/lode
-uv run lode search "knowledge graph" --json
-uv run lode context "how does indexing work" --json --budget 4000
+lode index ~/Projects/lode
+lode search "knowledge graph" --json
+lode context "how does indexing work" --json --budget 4000
 ```
 
 Run the local daemon:
 
 ```bash
-uv run loded --host 127.0.0.1 --port 7979
+loded --host 127.0.0.1 --port 7979
 ```
 
 Use Docker Compose:
