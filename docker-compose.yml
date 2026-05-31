@@ -1,0 +1,25 @@
+---
+services:
+  loded:
+    build: .
+    user: "${LODE_UID:-1000}:${LODE_GID:-1000}"
+    ports:
+      - "127.0.0.1:7979:7979"
+    environment:
+      LODE_DATA_DIR: /data
+      LODE_EMBEDDINGS_URL: http://embeddings:80
+      LODE_EMBEDDINGS_MODEL: Snowflake/snowflake-arctic-embed-s
+    volumes:
+      - ${LODE_DATA_DIR_HOST:-${HOME}/.local/share/lode}:/data
+      - ${LODE_REPOS_DIR:-${HOME}/Projects}:/repos:ro
+    depends_on:
+      - embeddings
+    restart: unless-stopped
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    command: ["--model-id", "Snowflake/snowflake-arctic-embed-s"]
+    ports:
+      - "127.0.0.1:7980:80"
+    volumes:
+      - ${LODE_HF_CACHE_DIR:-${HOME}/.cache/lode/hf-arctic-s}:/data
+    restart: unless-stopped
