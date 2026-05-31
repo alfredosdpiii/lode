@@ -1,20 +1,24 @@
 # Lode
 
-Lode is a fully local repository knowledge graph for coding agents.
+Lode gives coding agents a local map of a repository.
 
-It is a CLI-first, Docker-runnable code intelligence service. Lode indexes local repositories into a fast SQLite hot path and projects the same facts into embedded Kuzu for graph traversal. It is designed for agents that need quick answers to: where is this symbol, what is connected to it, what should I read, and what breaks if I change it?
+It indexes source files into SQLite for fast lookups, and can project the same
+facts into embedded Kuzu when you want graph traversal. The job is simple: answer
+"where is this symbol?", "what should I read?", "what calls this?", and "what
+might break if I touch it?" without sending the repo to a hosted code-search
+service.
 
 ## Goals
 
-- Fully local: no accounts, no hosted control plane, no remote API calls by default.
-- Agent-native: compact JSON, bounded output, confidence labels, and file:line citations.
-- CLI first: agents call `lode` directly; MCP can be a thin compatibility shim later.
-- Hybrid storage: SQLite for exact/FTS hot-path lookup, Kuzu for graph/Cypher/vector workloads.
-- Docker on login: run `loded` as a local service and keep indexes fresh.
+- Local by default: no account, hosted index, or remote API call required.
+- CLI first: agents can call `lode` directly and get bounded JSON with file:line citations.
+- Fast path in SQLite: exact lookup and FTS stay cheap enough for per-turn use.
+- Optional graph path in Kuzu: Cypher and vector experiments without leaving local disk.
+- Daemon-friendly: run `loded` on login if you want a warm local service.
 
 ## Current state
 
-This is an early open-source MVP. It currently provides:
+This is an early MVP. Today it can:
 
 - `lode index PATH` for Python, TypeScript/JavaScript, Markdown, and config-ish files.
 - `lode search QUERY --json` over SQLite FTS5.
@@ -27,7 +31,7 @@ This is an early open-source MVP. It currently provides:
 
 ## Install
 
-The PyPI package is `lode-kg`; it installs the `lode` CLI and `loded` daemon commands.
+The PyPI package is called `lode-kg`; it installs the `lode` CLI and `loded` daemon.
 
 ```bash
 uv tool install lode-kg
@@ -61,7 +65,9 @@ docker compose up -d --build
 curl http://127.0.0.1:7979/health
 ```
 
-The `loded` container runs as `${LODE_UID:-1000}:${LODE_GID:-1000}` so its SQLite file stays writable by the host CLI. Export `LODE_UID=$(id -u)` and `LODE_GID=$(id -g)` first if your user is not UID/GID 1000.
+The `loded` container runs as `${LODE_UID:-1000}:${LODE_GID:-1000}` so the host
+CLI can still write the SQLite file. If your user is not UID/GID 1000, export
+`LODE_UID=$(id -u)` and `LODE_GID=$(id -g)` first.
 
 Index a mounted repo through the daemon:
 
@@ -96,7 +102,9 @@ localhost HTTP or direct DB
         TEI embeddings service
 ```
 
-SQLite is the fast operational index. Kuzu is the graph analytics and Cypher projection. Facts should eventually be append-only and replayable so both projections can be rebuilt.
+SQLite handles the lookups an agent needs during a turn. Kuzu is for graph and
+Cypher work. Longer term, facts should be append-only and replayable so both
+projections can be rebuilt from the same log.
 
 ## CLI commands
 
@@ -112,7 +120,7 @@ lode embed [--limit N] [--url URL] [--model MODEL] [--json]
 lode serve --host 127.0.0.1 --port 7979
 ```
 
-`kg` and `kgd` are temporary aliases for `lode` and `loded` while the project is young.
+`kg` and `kgd` are temporary aliases for `lode` and `loded`.
 
 ## Storage layout
 
@@ -126,9 +134,16 @@ Default data directory:
 
 ## Embeddings
 
-The Docker Compose file starts Hugging Face Text Embeddings Inference with `Snowflake/snowflake-arctic-embed-s`. It exposes `/embed` on `127.0.0.1:7980` for local smoke tests and wires the daemon with `LODE_EMBEDDINGS_URL=http://embeddings:80`. Embeddings are intentionally secondary to exact search and graph traversal.
+Docker Compose starts Hugging Face Text Embeddings Inference with
+`Snowflake/snowflake-arctic-embed-s`. It exposes `/embed` on `127.0.0.1:7980`
+for local smoke tests and wires the daemon with
+`LODE_EMBEDDINGS_URL=http://embeddings:80`. Embeddings are optional; exact search
+and graph links should still carry the tool when no model is running.
 
-Model choice: Exa/web research found `snowflake-arctic-embed-s` is the strongest 33M-parameter / 384-dimension small English retrieval model in its comparison set, with MTEB retrieval NDCG@10 of 51.98 versus 51.68 for `BAAI/bge-small-en-v1.5`. It also has ONNX artifacts and was smoke-tested successfully with TEI CPU `/embed`.
+Model choice: `snowflake-arctic-embed-s` is the strongest 33M-parameter /
+384-dimension small English retrieval model in the comparison set I used, with
+MTEB retrieval NDCG@10 of 51.98 versus 51.68 for `BAAI/bge-small-en-v1.5`. It
+also has ONNX artifacts and passed a TEI CPU `/embed` smoke test.
 
 Embed queued nodes after indexing:
 
@@ -139,11 +154,19 @@ LODE_EMBEDDINGS_URL=http://127.0.0.1:7980 \
   uv run lode embed --limit 32 --json
 ```
 
-The first attempted default, `Qwen/Qwen3-Embedding-0.6B`, is not a safe TEI CPU default here: the container downloads the model, reports missing ONNX artifacts, falls back to Candle CPU warmup, and restarts before `/embed` serves. `BAAI/bge-small-en-v1.5` works, but `Snowflake/snowflake-arctic-embed-s` is the current small-model default because it is the same size class and scored slightly better in the retrieved benchmark data.
+`Qwen/Qwen3-Embedding-0.6B` was tested first, but it is a bad TEI CPU default
+here: the container downloads the model, reports missing ONNX artifacts, falls
+back to Candle CPU warmup, and restarts before `/embed` serves.
+`BAAI/bge-small-en-v1.5` works. `Snowflake/snowflake-arctic-embed-s` is the
+current small-model default because it is in the same size class and scored a bit
+better in the benchmark data I checked.
 
 ## Benchmarks
 
-Latest local run: 2026-05-31 on an AMD Ryzen 9 8945HS, 16 logical cores, Python 3.13.9. Raw artifacts are under ignored `bench-results/20260531T184011Z/`. The SQLite hot path is the per-turn agent path; Kuzu sync is an optional batch/analytics projection.
+Latest local run: 2026-05-31 on an AMD Ryzen 9 8945HS, 16 logical cores, Python
+3.13.9. Raw artifacts are under ignored `bench-results/20260531T184011Z/`. The
+numbers to watch are the SQLite hot-path timings; that is what an agent uses
+inside a normal turn. Kuzu sync is a batch/analytics projection.
 
 | Workload | Files | Nodes | Edges | Cold index | Hot re-index | Search p50 | Symbol p50 | Context p50 | Neighbor p50 | Kuzu sync | Embeddings |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -151,13 +174,17 @@ Latest local run: 2026-05-31 on an AMD Ryzen 9 8945HS, 16 logical cores, Python 
 | Medium app | 383 | 4,817 | 4,573 | 2,505.509 ms | 43.303 ms | 1.742 ms | 4.187 ms | 6.717 ms | 1.162 ms | 41,702.766 ms | 32 @ 33.5/s, 384d |
 | Larger app SQLite hot path | 1,270 | 15,846 | 15,453 | 17,342.433 ms | 95.348 ms | 14.359 ms | 15.739 ms | 34.076 ms | 3.437 ms | n/a | n/a |
 
-RepoBench-style retrieval, using the first 100 real rows from [`tianyang/repobench_python_v1.1`](https://huggingface.co/datasets/tianyang/repobench_python_v1.1) `cross_file_first`, scored retrieval-only quality:
+For RepoBench-style retrieval, I used the first 100 real rows from
+[`tianyang/repobench_python_v1.1`](https://huggingface.co/datasets/tianyang/repobench_python_v1.1)
+`cross_file_first` and scored only retrieval quality:
 
 | Samples | Mode | Mean retrieval | Hit@1 | Hit@3 | Hit@5 | Hit@10 | MRR |
 |---:|---|---:|---:|---:|---:|---:|---:|
 | 100 | context | 1.004 ms | 0.13 | 0.48 | 0.56 | 0.56 | 0.2985 |
 
-[RepoBench](https://openreview.net/forum?id=pPjZIOuQuF) is an ICLR 2024 benchmark for repository-level code completion. This adapter scores only whether Lode ranks the gold cross-file snippet path, not code generation.
+[RepoBench](https://openreview.net/forum?id=pPjZIOuQuF) is an ICLR 2024 benchmark
+for repository-level code completion. This adapter only checks whether Lode ranks
+the gold cross-file snippet path. It does not score code generation.
 
 Lode includes two benchmark entrypoints:
 
@@ -177,7 +204,9 @@ For RepoBench-style retrieval quality, export a RepoBench split to JSONL and run
 uv run python benchmarks/repobench_adapter.py --input repobench_cross_file_first.jsonl --limit 100 --json
 ```
 
-The adapter materializes each sample as a tiny repository and reports `hit_at_k` plus MRR for whether Lode ranks the gold cross-file snippet path. It is intended as a retrieval benchmark, not a code-generation benchmark.
+The adapter turns each sample into a tiny repository, then reports `hit_at_k` and
+MRR for the gold cross-file snippet path. It is a retrieval benchmark, not a
+code-generation benchmark.
 
 ## License
 
