@@ -127,6 +127,28 @@ LODE_EMBEDDINGS_URL=http://127.0.0.1:7980 \
 
 The first attempted default, `Qwen/Qwen3-Embedding-0.6B`, is not a safe TEI CPU default here: the container downloads the model, reports missing ONNX artifacts, falls back to Candle CPU warmup, and restarts before `/embed` serves. `BAAI/bge-small-en-v1.5` works, but `Snowflake/snowflake-arctic-embed-s` is the current small-model default because it is the same size class and scored slightly better in the retrieved benchmark data.
 
+## Benchmarks
+
+Lode includes two benchmark entrypoints:
+
+```bash
+# Local operational benchmark: cold/hot index, search, symbols, context, graph, optional Kuzu
+uv run python scripts/bench_lode.py --repo . --include-kuzu --json
+
+# If TEI is running locally, include embedding throughput/persistence
+docker compose up -d embeddings
+uv run python scripts/bench_lode.py --repo . --embed-url http://127.0.0.1:7980 --json
+```
+
+For RepoBench-style retrieval quality, export a RepoBench split to JSONL and run the adapter:
+
+```bash
+# Expected fields match tianyang/repobench_python_v1.1: context, cropped_code, file_path, gold_snippet_index
+uv run python benchmarks/repobench_adapter.py --input repobench_cross_file_first.jsonl --limit 100 --json
+```
+
+The adapter materializes each sample as a tiny repository and reports `hit_at_k` plus MRR for whether Lode ranks the gold cross-file snippet path. It is intended as a retrieval benchmark, not a code-generation benchmark.
+
 ## License
 
 Apache-2.0.

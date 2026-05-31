@@ -15,4 +15,5 @@ data/
 *.sqlite-shm
 *.sqlite-wal
 *.kuzu/
+bench-results/
 
