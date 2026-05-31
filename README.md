@@ -129,6 +129,22 @@ The first attempted default, `Qwen/Qwen3-Embedding-0.6B`, is not a safe TEI CPU 
 
 ## Benchmarks
 
+Latest local run: 2026-05-31 on an AMD Ryzen 9 8945HS, 16 logical cores, Python 3.13.9. Raw artifacts are under ignored `bench-results/20260531T184011Z/`. The SQLite hot path is the per-turn agent path; Kuzu sync is an optional batch/analytics projection.
+
+| Workload | Files | Nodes | Edges | Cold index | Hot re-index | Search p50 | Symbol p50 | Context p50 | Neighbor p50 | Kuzu sync | Embeddings |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Lode repo | 19 | 814 | 1,166 | 161.970 ms | 9.866 ms | 0.348 ms | 0.491 ms | 2.038 ms | 0.457 ms | 8,587.591 ms | 32 @ 24.3/s, 384d |
+| Medium app | 383 | 4,817 | 4,573 | 2,505.509 ms | 43.303 ms | 1.742 ms | 4.187 ms | 6.717 ms | 1.162 ms | 41,702.766 ms | 32 @ 33.5/s, 384d |
+| Larger app SQLite hot path | 1,270 | 15,846 | 15,453 | 17,342.433 ms | 95.348 ms | 14.359 ms | 15.739 ms | 34.076 ms | 3.437 ms | n/a | n/a |
+
+RepoBench-style retrieval, using the first 100 real rows from [`tianyang/repobench_python_v1.1`](https://huggingface.co/datasets/tianyang/repobench_python_v1.1) `cross_file_first`, scored retrieval-only quality:
+
+| Samples | Mode | Mean retrieval | Hit@1 | Hit@3 | Hit@5 | Hit@10 | MRR |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 100 | context | 1.004 ms | 0.13 | 0.48 | 0.56 | 0.56 | 0.2985 |
+
+[RepoBench](https://openreview.net/forum?id=pPjZIOuQuF) is an ICLR 2024 benchmark for repository-level code completion. This adapter scores only whether Lode ranks the gold cross-file snippet path, not code generation.
+
 Lode includes two benchmark entrypoints:
 
 ```bash
