@@ -9,6 +9,7 @@ import unittest
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 from lode.config import sqlite_path
 from lode.context import build_context_pack
@@ -84,6 +85,60 @@ class LodeIndexTests(unittest.TestCase):
                     symbols[0]["qname"], "nested.deep.module.long_symbol_name"
                 )
 
+    def test_neighbors_include_cross_file_callers_after_reindex(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            callee = repo / "callee.py"
+            callee.write_text(
+                "def target_function():\n    return 'ok'\n",
+                encoding="utf-8",
+            )
+            (repo / "caller.py").write_text(
+                "from callee import target_function\n\n"
+                "def call_target():\n    return target_function()\n",
+                encoding="utf-8",
+            )
+
+            stats = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreaterEqual(stats.resolved_calls, 1)
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                target = find_symbol(conn, "target_function")[0]
+                old_target_id = target["id"]
+                neighbors = get_neighbors(conn, old_target_id)
+                self.assert_has_resolved_caller(neighbors, "caller.call_target")
+
+            callee.write_text(
+                "\n\ndef target_function():\n    return 'updated'\n",
+                encoding="utf-8",
+            )
+            stats = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreaterEqual(stats.resolved_calls, 1)
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                target = find_symbol(conn, "target_function")[0]
+                self.assertNotEqual(target["id"], old_target_id)
+                neighbors = get_neighbors(conn, target["id"])
+                self.assert_has_resolved_caller(neighbors, "caller.call_target")
+
+    def assert_has_resolved_caller(
+        self, neighbors: dict[str, Any], caller_qname: str
+    ) -> None:
+        incoming = neighbors["incoming"]
+        self.assertTrue(
+            any(
+                item["edge"]["kind"] == "CALLS"
+                and item["edge"]["confidence"] == "resolved"
+                and item["node"]["qname"] == caller_qname
+                for item in incoming
+            ),
+            incoming,
+        )
+
     def test_cli_json_output(self) -> None:
         with (
             tempfile.TemporaryDirectory() as repo_tmp,
@@ -129,6 +184,30 @@ class LodeIndexTests(unittest.TestCase):
             search_payload = json.loads(search_result.stdout)
             self.assertTrue(search_payload["ok"])
             self.assertTrue(search_payload["results"])
+
+            impact_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "lode",
+                    "--data-dir",
+                    str(data_dir),
+                    "impact",
+                    "audit_user",
+                    "--repo",
+                    str(repo),
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            impact_payload = json.loads(impact_result.stdout)
+            self.assertTrue(impact_payload["ok"])
+            self.assertEqual(
+                impact_payload["results"][0]["callers"][0]["node"]["qname"],
+                "app.create_user",
+            )
 
     def test_cli_embed_persists_vectors_from_local_endpoint(self) -> None:
         with (

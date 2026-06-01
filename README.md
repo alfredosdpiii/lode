@@ -24,6 +24,7 @@ This is an early MVP. Today it can:
 - `lode search QUERY --json` over SQLite FTS5.
 - `lode symbol NAME --json` for exact-ish symbol lookup.
 - `lode context QUERY --json --budget N` for an agent context pack.
+- `lode impact TARGET --json` for callers, callees, related files, and raw graph edges.
 - `lode neighbors NODE_ID --json` for direct graph neighbors.
 - `loded` local HTTP daemon with `/health`, `/status`, `/index`, `/search`, and `/context`.
 - Optional Kuzu projection code when the `kuzu` extra is installed.
@@ -48,7 +49,8 @@ uv tool install 'lode-kg[kuzu]'
 
 This repo also ships a Pi skill at `skills/lode/`. The skill is not the CLI; it
 is the short instruction pack that tells Pi when to reach for `lode index`,
-`lode search`, `lode symbol`, and `lode context` during codebase work.
+`lode search`, `lode symbol`, `lode context`, and `lode impact` during codebase
+work.
 
 Install it globally for your Pi user:
 
@@ -66,7 +68,7 @@ cp -R skills/lode/. .agents/skills/lode/
 
 Then run `/reload` inside Pi, or restart Pi. You can force-load it with
 `/skill:lode`; otherwise Pi should pick it up when a task calls for local repo
-search, symbol lookup, graph neighbors, or a bounded context pack.
+search, symbol lookup, impact checks, graph neighbors, or a bounded context pack.
 
 Review `skills/lode/SKILL.md` before installing it from any checkout you do not
 trust. Skills are instructions to your agent, not inert docs.
@@ -141,6 +143,7 @@ lode status [--json]
 lode search QUERY [--repo PATH] [--limit N] [--json]
 lode symbol NAME [--repo PATH] [--limit N] [--json]
 lode context QUERY [--repo PATH] [--budget N] [--json]
+lode impact TARGET [--repo PATH] [--limit N] [--neighbor-limit N] [--json]
 lode neighbors NODE_ID [--json]
 lode kuzu-sync
 lode embed [--limit N] [--url URL] [--model MODEL] [--json]

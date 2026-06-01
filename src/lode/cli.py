@@ -18,6 +18,7 @@ from .storage import (
     embedding_counts,
     find_symbol,
     get_neighbors,
+    get_node,
     list_repos,
     pending_embedding_nodes,
     repo_filter,
@@ -96,6 +97,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=80)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_neighbors)
+
+    p = sub.add_parser(
+        "impact", help="Show callers, callees, and files around a symbol or node"
+    )
+    p.add_argument("target")
+    p.add_argument("--repo")
+    p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--neighbor-limit", type=int, default=200)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_impact)
 
     p = sub.add_parser("kuzu-sync", help="Project SQLite facts into embedded Kuzu")
     p.add_argument("--json", action="store_true")
@@ -178,6 +189,74 @@ def cmd_neighbors(args: argparse.Namespace) -> int:
         output = {"ok": True, **get_neighbors(conn, args.node_id, limit=args.limit)}
     emit(output, args.json)
     return 0
+
+
+def cmd_impact(args: argparse.Namespace) -> int:
+    with closing(connect(sqlite_path(args.data_dir))) as conn:
+        repo_id = repo_filter(conn, args.repo)
+        targets = impact_targets(conn, args.target, repo_id, limit=args.limit)
+        output = {
+            "ok": True,
+            "query": args.target,
+            "results": [
+                impact_entry(conn, target, limit=args.neighbor_limit)
+                for target in targets
+            ],
+        }
+    emit(output, args.json)
+    return 0
+
+
+def impact_targets(
+    conn: sqlite3.Connection, target: str, repo_id: str | None, limit: int
+) -> list[dict[str, Any]]:
+    node = get_node(conn, target)
+    if node and (repo_id is None or node.get("repo_id") == repo_id):
+        return [node]
+    symbols = find_symbol(conn, target, repo_id=repo_id, limit=limit)
+    if symbols:
+        return symbols
+    return search_nodes(conn, target, repo_id=repo_id, limit=limit)
+
+
+def impact_entry(
+    conn: sqlite3.Connection, target: dict[str, Any], limit: int
+) -> dict[str, Any]:
+    neighbors = get_neighbors(conn, str(target["id"]), limit=limit)
+    incoming = neighbors["incoming"]
+    outgoing = neighbors["outgoing"]
+    callers = [item for item in incoming if item["edge"]["kind"] == "CALLS"]
+    callees = [item for item in outgoing if item["edge"]["kind"] == "CALLS"]
+    files = impact_files(target, incoming, outgoing)
+    return {
+        "target": target,
+        "summary": {
+            "callers": len(callers),
+            "callees": len(callees),
+            "incoming": len(incoming),
+            "outgoing": len(outgoing),
+            "files": len(files),
+        },
+        "files": files,
+        "callers": callers,
+        "callees": callees,
+        "incoming": incoming,
+        "outgoing": outgoing,
+    }
+
+
+def impact_files(
+    target: dict[str, Any],
+    incoming: list[dict[str, Any]],
+    outgoing: list[dict[str, Any]],
+) -> list[str]:
+    paths = {str(target.get("path") or "")}
+    for item in [*incoming, *outgoing]:
+        node = item.get("node") or {}
+        if node.get("kind") in {"ExternalSymbol", "ExternalDependency"}:
+            continue
+        paths.add(str(node.get("path") or ""))
+    return sorted(path for path in paths if path)
 
 
 def cmd_kuzu_sync(args: argparse.Namespace) -> int:

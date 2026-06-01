@@ -36,6 +36,7 @@ lode status --json
 lode search "auth middleware" --repo "$PWD" --limit 10 --json
 lode symbol "UserService" --repo "$PWD" --limit 10 --json
 lode context "how does auth middleware work" --repo "$PWD" --budget 6000 --json
+lode impact "UserService" --repo "$PWD" --neighbor-limit 200 --json
 ```
 
 If results seem stale, re-index the repo before trusting search output.
@@ -109,6 +110,21 @@ lode context "task or question" --repo /path/to/repo --budget 6000 --limit 10 --
 
 Use before implementation or review to get a compact set of likely relevant files,
 symbols, and citations. Treat it as a reading shortlist, not a proof.
+
+### Check impact
+
+When the user asks for impact, blast radius, callers, callees, or "what will this
+change affect", re-index first, then run impact:
+
+```bash
+lode index "$PWD"
+lode impact "symbol_or_node_id" --repo "$PWD" --neighbor-limit 200 --json
+```
+
+Read `results[].callers`, `results[].callees`, `results[].files`, and the raw
+`incoming`/`outgoing` edges. If `results` has multiple targets, call out the
+ambiguity instead of pretending there is one symbol. Use this as a map of likely
+impact, then verify with LSP, exact search, and tests before editing.
 
 ### Inspect graph neighbors
 

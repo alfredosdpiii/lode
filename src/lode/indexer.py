@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .model import Edge, FileIndex, Node
-from .storage import connect, remove_missing_files, replace_file_index, upsert_repo
+from .storage import (
+    connect,
+    remove_missing_files,
+    replace_file_index,
+    resolve_local_call_edges,
+    upsert_repo,
+)
 
 SOURCE_EXTENSIONS = {
     ".py": "python",
@@ -57,6 +63,7 @@ class IndexStats:
     indexed: int = 0
     skipped_unchanged: int = 0
     removed: int = 0
+    resolved_calls: int = 0
     nodes: int = 0
     edges: int = 0
 
@@ -92,6 +99,7 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
             stats.nodes += len(file_index.nodes)
             stats.edges += len(file_index.edges)
         stats.removed = remove_missing_files(conn, repo_id, live_paths)
+        stats.resolved_calls = resolve_local_call_edges(conn, repo_id)
         return stats
     finally:
         conn.close()
