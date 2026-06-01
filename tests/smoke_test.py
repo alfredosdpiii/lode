@@ -20,7 +20,7 @@ def run_help(command: str) -> None:
 
 
 def main() -> None:
-    if version("lode-kg") != "0.1.0":
+    if version("lode-kg") != "0.1.1":
         raise AssertionError("installed package version mismatch")
 
     import lode.cli  # noqa: F401
