@@ -40,6 +40,39 @@ lode context "how does auth middleware work" --repo "$PWD" --budget 6000 --json
 
 If results seem stale, re-index the repo before trusting search output.
 
+## Reindexing after branch or PR changes
+
+Lode supports incremental re-indexing. After `git pull`, a branch switch, or a PR
+merge, run indexing again from the checked-out worktree:
+
+```bash
+lode index "$PWD"
+```
+
+Unchanged files are skipped by content hash. Changed files are parsed again. Deleted
+files are removed from the live file, node, edge, and FTS indexes.
+
+If embeddings are part of the workflow, embed again after indexing so changed nodes
+get fresh vectors:
+
+```bash
+lode embed --limit 256
+```
+
+If Kuzu graph projection is in use, either index with sync enabled or sync after:
+
+```bash
+lode index "$PWD" --sync-kuzu
+lode kuzu-sync
+```
+
+Repo identity is based on the resolved path. Separate branch indexes need separate
+worktrees or separate data dirs. Global flags go before the subcommand, for example:
+
+```bash
+lode --data-dir /tmp/lode-main index "$PWD"
+```
+
 ## Command guide
 
 ### Index a repo

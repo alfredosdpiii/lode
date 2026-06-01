@@ -44,6 +44,33 @@ Or install with the optional embedded Kuzu projection support:
 uv tool install 'lode-kg[kuzu]'
 ```
 
+### Install the Pi skill
+
+This repo also ships a Pi skill at `skills/lode/`. The skill is not the CLI; it
+is the short instruction pack that tells Pi when to reach for `lode index`,
+`lode search`, `lode symbol`, and `lode context` during codebase work.
+
+Install it globally for your Pi user:
+
+```bash
+mkdir -p ~/.pi/agent/skills/lode
+cp -R skills/lode/. ~/.pi/agent/skills/lode/
+```
+
+Or install it only for one project:
+
+```bash
+mkdir -p .agents/skills/lode
+cp -R skills/lode/. .agents/skills/lode/
+```
+
+Then run `/reload` inside Pi, or restart Pi. You can force-load it with
+`/skill:lode`; otherwise Pi should pick it up when a task calls for local repo
+search, symbol lookup, graph neighbors, or a bounded context pack.
+
+Review `skills/lode/SKILL.md` before installing it from any checkout you do not
+trust. Skills are instructions to your agent, not inert docs.
+
 ## Quick start
 
 ```bash
@@ -174,17 +201,33 @@ inside a normal turn. Kuzu sync is a batch/analytics projection.
 | Medium app | 383 | 4,817 | 4,573 | 2,505.509 ms | 43.303 ms | 1.742 ms | 4.187 ms | 6.717 ms | 1.162 ms | 41,702.766 ms | 32 @ 33.5/s, 384d |
 | Larger app SQLite hot path | 1,270 | 15,846 | 15,453 | 17,342.433 ms | 95.348 ms | 14.359 ms | 15.739 ms | 34.076 ms | 3.437 ms | n/a | n/a |
 
-For RepoBench-style retrieval, I used the first 100 real rows from
-[`tianyang/repobench_python_v1.1`](https://huggingface.co/datasets/tianyang/repobench_python_v1.1)
-`cross_file_first` and scored only retrieval quality:
+For RepoBench-style retrieval, I ran all Python v1.1 cross-file rows from
+[`tianyang/repobench_python_v1.1`](https://huggingface.co/datasets/tianyang/repobench_python_v1.1).
+The run uses `context` mode, `--query-lines 5`, `--search-limit 30`,
+`--context-budget 6000`, and reports retrieval only: did Lode rank the gold
+cross-file snippet path high enough? It does not score code generation.
 
-| Samples | Mode | Mean retrieval | Hit@1 | Hit@3 | Hit@5 | Hit@10 | MRR |
-|---:|---|---:|---:|---:|---:|---:|---:|
-| 100 | context | 1.004 ms | 0.13 | 0.48 | 0.56 | 0.56 | 0.2985 |
+Raw artifacts are under ignored
+`bench-results/20260531T203339Z-full-repobench-r/`. Fifteen rows were skipped
+because `gold_snippet_index` pointed outside the provided context list.
+
+| Split | Samples | Skipped | Mean retrieval | Hit@1 | Hit@3 | Hit@5 | Hit@10 | MRR |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `cross_file_first` | 8,026 | 7 | 1.876 ms | 0.129828 | 0.373162 | 0.487914 | 0.565163 | 0.272828 |
+| `cross_file_random` | 7,610 | 8 | 1.796 ms | 0.197766 | 0.428909 | 0.515769 | 0.572799 | 0.327461 |
+| Combined | 15,636 | 15 | 1.837 ms | 0.162893 | 0.400294 | 0.501471 | 0.568879 | 0.299418 |
 
 [RepoBench](https://openreview.net/forum?id=pPjZIOuQuF) is an ICLR 2024 benchmark
-for repository-level code completion. This adapter only checks whether Lode ranks
-the gold cross-file snippet path. It does not score code generation.
+for repository-level code completion. I did not find an official v1.1
+leaderboard. The closest public comparison is the original RepoBench-R paper
+table, so the ranks below are a sanity check against older baselines.
+
+| RepoBench-R slice | Lode rank vs paper baselines | What that means |
+|---|---:|---|
+| Hard `cross_file_random` | #2/6 on Hit@1 and Hit@3, #3/6 on Hit@5 | The strongest slice; only UniXcoder is clearly ahead on Hit@1/Hit@3. |
+| Hard `cross_file_first` | #3/6 on Hit@1 and Hit@3, #4/6 on Hit@5 | Beats Random, CodeBERT, and Edit on the first two cutoffs. |
+| Easy `cross_file_random` | #3/6 on Hit@1, #6/6 on Hit@3 | Finds the top file often enough, but loses recall by rank 3. |
+| Easy `cross_file_first` | #6/6 on Hit@1 and Hit@3 | Weak spot. Jaccard, Edit, CodeBERT, Random, and UniXcoder all do better. |
 
 Lode includes two benchmark entrypoints:
 
