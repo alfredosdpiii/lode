@@ -12,6 +12,7 @@ from typing import Any
 
 from .config import default_data_dir, kuzu_path, sqlite_path
 from .context import build_context_pack
+from .graph import blast_radius, impact_report, impact_targets
 from .indexer import index_repo
 from .storage import (
     connect,
@@ -99,12 +100,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_neighbors)
 
     p = sub.add_parser(
-        "impact", help="Show callers, callees, and files around a symbol or node"
+        "impact", help="Show callers, callees, and blast radius around a symbol or node"
     )
     p.add_argument("target")
     p.add_argument("--repo")
     p.add_argument("--limit", type=int, default=5)
     p.add_argument("--neighbor-limit", type=int, default=200)
+    p.add_argument("--depth", type=int, default=3, help="BFS depth for blast radius (1-10)")
+    p.add_argument("--max-nodes", type=int, default=200, help="Max nodes in blast radius")
+    p.add_argument(
+        "--direction",
+        choices=["up", "down", "both"],
+        default="both",
+        help="Traversal direction: up (dependents), down (dependencies), or both",
+    )
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_impact)
 
@@ -199,64 +208,19 @@ def cmd_impact(args: argparse.Namespace) -> int:
             "ok": True,
             "query": args.target,
             "results": [
-                impact_entry(conn, target, limit=args.neighbor_limit)
+                impact_report(
+                    conn,
+                    target,
+                    neighbor_limit=args.neighbor_limit,
+                    depth=args.depth,
+                    max_nodes=args.max_nodes,
+                    direction=args.direction,
+                )
                 for target in targets
             ],
         }
     emit(output, args.json)
     return 0
-
-
-def impact_targets(
-    conn: sqlite3.Connection, target: str, repo_id: str | None, limit: int
-) -> list[dict[str, Any]]:
-    node = get_node(conn, target)
-    if node and (repo_id is None or node.get("repo_id") == repo_id):
-        return [node]
-    symbols = find_symbol(conn, target, repo_id=repo_id, limit=limit)
-    if symbols:
-        return symbols
-    return search_nodes(conn, target, repo_id=repo_id, limit=limit)
-
-
-def impact_entry(
-    conn: sqlite3.Connection, target: dict[str, Any], limit: int
-) -> dict[str, Any]:
-    neighbors = get_neighbors(conn, str(target["id"]), limit=limit)
-    incoming = neighbors["incoming"]
-    outgoing = neighbors["outgoing"]
-    callers = [item for item in incoming if item["edge"]["kind"] == "CALLS"]
-    callees = [item for item in outgoing if item["edge"]["kind"] == "CALLS"]
-    files = impact_files(target, incoming, outgoing)
-    return {
-        "target": target,
-        "summary": {
-            "callers": len(callers),
-            "callees": len(callees),
-            "incoming": len(incoming),
-            "outgoing": len(outgoing),
-            "files": len(files),
-        },
-        "files": files,
-        "callers": callers,
-        "callees": callees,
-        "incoming": incoming,
-        "outgoing": outgoing,
-    }
-
-
-def impact_files(
-    target: dict[str, Any],
-    incoming: list[dict[str, Any]],
-    outgoing: list[dict[str, Any]],
-) -> list[str]:
-    paths = {str(target.get("path") or "")}
-    for item in [*incoming, *outgoing]:
-        node = item.get("node") or {}
-        if node.get("kind") in {"ExternalSymbol", "ExternalDependency"}:
-            continue
-        paths.add(str(node.get("path") or ""))
-    return sorted(path for path in paths if path)
 
 
 def cmd_kuzu_sync(args: argparse.Namespace) -> int:
@@ -316,7 +280,7 @@ def emit(data: dict[str, Any], as_json: bool) -> None:
     if as_json or not sys.stdout.isatty():
         print(json.dumps(data, indent=2, sort_keys=True))
         return
-    if "results" in data:
+    if "results" in data and data.get("query") is None:
         for row in data["results"]:
             print(f"{row['kind']:12} {row['qname']} {row['path']}:{row['start_line']}")
     elif "repos" in data:
@@ -324,6 +288,37 @@ def emit(data: dict[str, Any], as_json: bool) -> None:
             print(
                 f"{repo['name']:24} files={repo['files']} nodes={repo['nodes']} root={repo['root']}"
             )
+    elif "results" in data and data.get("query") is not None:
+        for result in data["results"]:
+            target = result.get("target") or {}
+            summary = result.get("summary") or {}
+            qname = target.get("qname") or target.get("name") or data["query"]
+            kind = target.get("kind") or "?"
+            print(f"  {kind} {qname}")
+            print(f"    callers={summary.get('callers', 0)}  callees={summary.get('callees', 0)}  "
+                  f"files={summary.get('files', 0)}")
+            print(f"    upstream={summary.get('upstream', 0)}  downstream={summary.get('downstream', 0)}  "
+                  f"entrypoints={summary.get('entrypoints', 0)}  depth={summary.get('depth', '?')}")
+            radius = result.get("blast_radius") or {}
+            for entry in radius.get("upstream", []):
+                node = entry.get("node") or {}
+                d = entry.get("distance", "?")
+                via = entry.get("via", "?")
+                conf = entry.get("confidence", "?")
+                print(f"    [up d={d} {via} {conf}] {node.get('kind', '?')} {node.get('qname', '?')}")
+            for entry in radius.get("downstream", []):
+                node = entry.get("node") or {}
+                d = entry.get("distance", "?")
+                via = entry.get("via", "?")
+                conf = entry.get("confidence", "?")
+                print(f"    [dn d={d} {via} {conf}] {node.get('kind', '?')} {node.get('qname', '?')}")
+            for fentry in radius.get("files", []):
+                print(f"    [file d={fentry.get('distance', '?')}] {fentry.get('path', '?')}")
+            for ep in radius.get("entrypoints", []):
+                node = ep.get("node") or {}
+                print(f"    [entrypoint] {node.get('kind', '?')} {node.get('qname', '?')}")
+            if summary.get("truncated"):
+                print("    (truncated - increase --max-nodes for more)")
     else:
         print(json.dumps(data, indent=2, sort_keys=True))
 

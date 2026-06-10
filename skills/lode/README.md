@@ -1,7 +1,7 @@
 # Lode Skill
 
 Pi skill for using the local `lode` repository knowledge graph CLI during codebase
-exploration, context gathering, and impact analysis.
+exploration, context gathering, and blast-radius impact analysis.
 
 ## Installation
 

@@ -12,8 +12,9 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import default_data_dir, sqlite_path
 from .context import build_context_pack
+from .graph import blast_radius, impact_report, impact_targets
 from .indexer import index_repo
-from .storage import connect, list_repos, repo_filter, search_nodes
+from .storage import connect, get_node, list_repos, repo_filter, search_nodes
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -67,6 +68,36 @@ class LodeHandler(BaseHTTPRequestHandler):
                     }
                 )
             return
+        if parsed.path == "/impact":
+            params = parse_qs(parsed.query)
+            target = first(params, "target") or first(params, "q") or ""
+            repo = first(params, "repo")
+            limit = int(first(params, "limit") or 5)
+            neighbor_limit = int(first(params, "neighbor_limit") or 200)
+            depth = int(first(params, "depth") or 3)
+            max_nodes = int(first(params, "max_nodes") or 200)
+            direction = first(params, "direction") or "both"
+            with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
+                repo_id = repo_filter(conn, repo)
+                targets = impact_targets(conn, target, repo_id, limit=limit)
+                self.send_json(
+                    {
+                        "ok": True,
+                        "query": target,
+                        "results": [
+                            impact_report(
+                                conn,
+                                t,
+                                neighbor_limit=neighbor_limit,
+                                depth=depth,
+                                max_nodes=max_nodes,
+                                direction=direction,
+                            )
+                            for t in targets
+                        ],
+                    }
+                )
+            return
         self.send_json({"ok": False, "error": "not found"}, status=404)
 
     def do_POST(self) -> None:
@@ -104,6 +135,35 @@ class LodeHandler(BaseHTTPRequestHandler):
                             **build_context_pack(
                                 conn, query, repo_path=repo, budget=budget, limit=limit
                             ),
+                        }
+                    )
+                return
+            if self.path == "/impact":
+                target = str(required(body, "target"))
+                repo = body.get("repo")
+                limit = int(body.get("limit") or 5)
+                neighbor_limit = int(body.get("neighbor_limit") or 200)
+                depth = int(body.get("depth") or 3)
+                max_nodes = int(body.get("max_nodes") or 200)
+                direction = body.get("direction") or "both"
+                with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
+                    repo_id = repo_filter(conn, repo)
+                    targets = impact_targets(conn, target, repo_id, limit=limit)
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "query": target,
+                            "results": [
+                                impact_report(
+                                    conn,
+                                    t,
+                                    neighbor_limit=neighbor_limit,
+                                    depth=depth,
+                                    max_nodes=max_nodes,
+                                    direction=direction,
+                                )
+                                for t in targets
+                            ],
                         }
                     )
                 return

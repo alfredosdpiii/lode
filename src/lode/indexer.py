@@ -6,13 +6,14 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from .graph import resolve_graph
 from .model import Edge, FileIndex, Node
 from .storage import (
     connect,
     remove_missing_files,
     replace_file_index,
-    resolve_local_call_edges,
     upsert_repo,
 )
 
@@ -63,7 +64,9 @@ class IndexStats:
     indexed: int = 0
     skipped_unchanged: int = 0
     removed: int = 0
+    resolved_imports: int = 0
     resolved_calls: int = 0
+    resolved_extends: int = 0
     nodes: int = 0
     edges: int = 0
 
@@ -99,7 +102,10 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
             stats.nodes += len(file_index.nodes)
             stats.edges += len(file_index.edges)
         stats.removed = remove_missing_files(conn, repo_id, live_paths)
-        stats.resolved_calls = resolve_local_call_edges(conn, repo_id)
+        resolved = resolve_graph(conn, repo_id)
+        stats.resolved_imports = resolved.get("imports", 0)
+        stats.resolved_calls = resolved.get("calls", 0)
+        stats.resolved_extends = resolved.get("extends", 0)
         return stats
     finally:
         conn.close()
@@ -158,15 +164,19 @@ def parse_file(root: Path, path: Path, digest: str | None = None) -> FileIndex:
     nodes = [file_node]
     edges: list[Edge] = []
     if language == "python":
-        extra_nodes, extra_edges = parse_python(rel, text, file_node.id)
+        extra_nodes, extra_edges, import_bindings = parse_python(rel, text, file_node.id)
     elif language in {"typescript", "javascript"}:
-        extra_nodes, extra_edges = parse_ts_js(rel, text, file_node.id, language)
+        extra_nodes, extra_edges, import_bindings = parse_ts_js(rel, text, file_node.id, language)
     elif language == "markdown":
         extra_nodes, extra_edges = parse_markdown(rel, text, file_node.id)
+        import_bindings = []
     else:
         extra_nodes, extra_edges = parse_config(rel, text, file_node.id, language)
+        import_bindings = []
     nodes.extend(extra_nodes)
     edges.extend(extra_edges)
+    if import_bindings:
+        file_node.extra["imports"] = import_bindings
     size = path.stat().st_size
     return FileIndex(
         path=rel,
@@ -218,11 +228,38 @@ def module_qname(rel: str) -> str:
     return without_suffix.replace("/", ".")
 
 
+def _split_import_clause(clause: str) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    if not clause:
+        return parts
+    default_match = re.match(r"^(\w+)", clause)
+    if default_match:
+        parts.append({"name": "default", "alias": default_match.group(1)})
+    namespace_match = re.search(r"\*\s+as\s+(\w+)", clause)
+    if namespace_match:
+        parts.append({"name": "*", "alias": namespace_match.group(1)})
+    named_match = re.search(r"\{([^}]+)\}", clause)
+    if named_match:
+        for item in named_match.group(1).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if " as " in item:
+                orig, alias = item.split(" as ", 1)
+                parts.append({"name": orig.strip(), "alias": alias.strip()})
+            else:
+                parts.append({"name": item, "alias": None})
+    if not parts and not default_match and not namespace_match and not named_match:
+        parts.append({"name": None, "alias": None})
+    return parts
+
+
 def parse_python(
     rel: str, text: str, file_node_id: str
-) -> tuple[list[Node], list[Edge]]:
+) -> tuple[list[Node], list[Edge], list[dict[str, Any]]]:
     nodes: list[Node] = []
     edges: list[Edge] = []
+    import_bindings: list[dict[str, Any]] = []
     module = module_qname(rel)
     try:
         tree = ast.parse(text)
@@ -286,13 +323,38 @@ def parse_python(
                     nodes.extend(route_nodes)
                     edges.extend(route_edges)
 
+    import_bindings: list[dict[str, Any]] = []
     for item in ast.walk(tree):
-        if isinstance(item, (ast.Import, ast.ImportFrom)):
-            imported = python_import_name(item)
-            if imported:
-                dep = external_node("ExternalDependency", imported, rel)
+        if isinstance(item, ast.Import):
+            for alias in item.names:
+                module = alias.name
+                import_bindings.append(
+                    {"module": module, "name": None, "alias": None}
+                    if alias.asname is None
+                    else {"module": module, "name": alias.name, "alias": alias.asname}
+                )
+                dep = external_node("ExternalDependency", module, rel)
                 nodes.append(dep)
-                edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", imported))
+                edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", module))
+        elif isinstance(item, ast.ImportFrom):
+            module = item.module or ""
+            if item.level:
+                module = "." * item.level + module
+            for alias in item.names:
+                if alias.name == "*":
+                    import_bindings.append({"module": module, "name": "*", "alias": None})
+                elif alias.asname:
+                    import_bindings.append(
+                        {"module": module, "name": alias.name, "alias": alias.asname}
+                    )
+                else:
+                    import_bindings.append(
+                        {"module": module, "name": alias.name, "alias": None}
+                    )
+            if module:
+                dep = external_node("ExternalDependency", module, rel)
+                nodes.append(dep)
+                edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", module))
 
     function_stack = build_python_function_ranges(nodes)
     for call in [n for n in ast.walk(tree) if isinstance(n, ast.Call)]:
@@ -310,7 +372,7 @@ def parse_python(
             target = external_node("ExternalSymbol", call_name, rel)
             nodes.append(target)
             edges.append(Edge(caller_id, target.id, "CALLS", "heuristic", call_name))
-    return nodes, edges
+    return nodes, edges, import_bindings
 
 
 def python_function_node(
@@ -419,15 +481,6 @@ def route_facts_for_python(
     return nodes, edges
 
 
-def python_import_name(item: ast.Import | ast.ImportFrom) -> str:
-    if isinstance(item, ast.Import):
-        return item.names[0].name if item.names else ""
-    module = item.module or ""
-    if item.level:
-        return "." * item.level + module
-    return module
-
-
 def dotted_name(node: ast.AST) -> str:
     if isinstance(node, ast.Name):
         return node.id
@@ -461,18 +514,30 @@ def enclosing_node_for_line(
 
 def parse_ts_js(
     rel: str, text: str, file_node_id: str, language: str
-) -> tuple[list[Node], list[Edge]]:
+) -> tuple[list[Node], list[Edge], list[dict[str, Any]]]:
     nodes: list[Node] = []
     edges: list[Edge] = []
+    import_bindings: list[dict[str, Any]] = []
     module = module_qname(rel)
     lines = text.splitlines()
+
+    import_bindings: list[dict[str, Any]] = []
     for match in re.finditer(
-        r"(?:import\s+.*?\s+from\s+|require\()(['\"])([^'\"]+)\1", text
+        r"import\s+(.*?)\s+from\s+(['\"])([^'\"]+)\2", text
     ):
-        dep_name = match.group(2)
-        dep = external_node("ExternalDependency", dep_name, rel)
+        clause = match.group(1).strip()
+        mod = match.group(3)
+        for part in _split_import_clause(clause):
+            import_bindings.append({"module": mod, **part})
+        dep = external_node("ExternalDependency", mod, rel)
         nodes.append(dep)
-        edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", dep_name))
+        edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", mod))
+    for match in re.finditer(r"require\(\s*(['\"])([^'\"]+)\1\s*\)", text):
+        mod = match.group(2)
+        import_bindings.append({"module": mod, "name": None, "alias": None})
+        dep = external_node("ExternalDependency", mod, rel)
+        nodes.append(dep)
+        edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", mod))
 
     symbol_by_name: dict[str, str] = {}
     patterns = [

@@ -118,13 +118,31 @@ change affect", re-index first, then run impact:
 
 ```bash
 lode index "$PWD"
-lode impact "symbol_or_node_id" --repo "$PWD" --neighbor-limit 200 --json
+lode impact "symbol_or_node_id" --repo "$PWD" --depth 3 --direction both --json
 ```
 
-Read `results[].callers`, `results[].callees`, `results[].files`, and the raw
-`incoming`/`outgoing` edges. If `results` has multiple targets, call out the
-ambiguity instead of pretending there is one symbol. Use this as a map of likely
-impact, then verify with LSP, exact search, and tests before editing.
+The impact report includes:
+
+- **callers / callees**: direct CALLS edges (same as before)
+- **blast radius**: bounded BFS traversal over CALLS, EXTENDS, HANDLES, CONTAINS,
+  and IMPORTS edges, with distance and confidence tracking
+- **files**: all files touched by the blast radius, sorted by distance
+- **entrypoints**: Route nodes reachable upstream (API endpoints affected by the change)
+
+Direction flags:
+
+- `--direction up` shows only dependents (things that break when the target changes)
+- `--direction down` shows only dependencies (things the target relies on)
+- `--direction both` (default) shows both
+
+Use `--depth N` (default 3, max 10) to control traversal depth and `--max-nodes N`
+(default 200) to bound result size. If `truncated` is true, increase `--max-nodes`.
+
+Read `results[].callers`, `results[].callees`, `results[].files`, and the
+`results[].blast_radius` with `upstream`, `downstream`, and `entrypoints`.
+If `results` has multiple targets, call out the ambiguity instead of pretending
+there is one symbol. Use this as a map of likely impact, then verify with LSP,
+exact search, and tests before editing.
 
 ### Inspect graph neighbors
 
