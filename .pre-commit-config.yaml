@@ -22,7 +22,7 @@ repos:
         language: system
         pass_filenames: false
       - id: linked-todos
-        name: linked TODO/FIXME guard
+        name: linked maintenance marker guard
         entry: uv run python scripts/check_todos.py
         language: system
         pass_filenames: false
