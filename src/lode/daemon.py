@@ -74,8 +74,9 @@ class LodeHandler(BaseHTTPRequestHandler):
             repo = first(params, "repo")
             limit = int(first(params, "limit") or 5)
             neighbor_limit = int(first(params, "neighbor_limit") or 200)
-            depth = int(first(params, "depth") or 3)
-            max_nodes = int(first(params, "max_nodes") or 200)
+            depth_param = first(params, "depth")
+            depth = int(depth_param) if depth_param else None
+            max_nodes = int(first(params, "max_nodes") or 1000)
             direction = first(params, "direction") or "both"
             with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
                 repo_id = repo_filter(conn, repo)
@@ -143,8 +144,9 @@ class LodeHandler(BaseHTTPRequestHandler):
                 repo = body.get("repo")
                 limit = int(body.get("limit") or 5)
                 neighbor_limit = int(body.get("neighbor_limit") or 200)
-                depth = int(body.get("depth") or 3)
-                max_nodes = int(body.get("max_nodes") or 200)
+                depth_value = body.get("depth")
+                depth = int(depth_value) if depth_value not in (None, "") else None
+                max_nodes = int(body.get("max_nodes") or 1000)
                 direction = body.get("direction") or "both"
                 with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
                     repo_id = repo_filter(conn, repo)

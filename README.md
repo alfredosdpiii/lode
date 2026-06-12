@@ -24,7 +24,7 @@ This is an early MVP. Today it can:
 - `lode search QUERY --json` over SQLite FTS5.
 - `lode symbol NAME --json` for exact-ish symbol lookup.
 - `lode context QUERY --json --budget N` for an agent context pack.
-- `lode impact TARGET --json` for callers, callees, blast radius, and affected entrypoints.
+- `lode impact TARGET --json` for callers, callees, full reachable blast radius, and affected entrypoints.
 - `lode neighbors NODE_ID --json` for direct graph neighbors.
 - `loded` local HTTP daemon with `/health`, `/status`, `/index`, `/search`, and `/context`.
 - Optional Kuzu projection code when the `kuzu` extra is installed.

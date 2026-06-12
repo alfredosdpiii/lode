@@ -396,14 +396,17 @@ def compact_radius_node(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
 def blast_radius(
     conn: sqlite3.Connection,
     node_id: str,
-    depth: int = 3,
-    max_nodes: int = 200,
+    depth: int | None = None,
+    max_nodes: int = 1000,
     direction: str = "both",
 ) -> dict[str, Any]:
     """Bounded BFS over dependency edges around a node.
 
     upstream = nodes that depend on the target (break when it changes),
     downstream = nodes the target depends on.
+
+    By default traversal is complete for the reachable graph and bounded by
+    max_nodes. Pass depth to intentionally limit noisy or very large graphs.
     """
     if direction not in {"up", "down", "both"}:
         raise ValueError("direction must be 'up', 'down', or 'both'")
@@ -411,8 +414,8 @@ def blast_radius(
     if not target:
         return {}
     repo_id = str(target["repo_id"])
-    depth = max(1, min(int(depth), 10))
-    max_nodes = max(1, min(int(max_nodes), 2000))
+    depth_limit = None if depth is None or int(depth) <= 0 else int(depth)
+    max_nodes = max(1, min(int(max_nodes), 10000))
 
     seeds_up: dict[str, str] = {node_id: str(target.get("qname") or "")}
     seeds_down: dict[str, str] = dict(seeds_up)
@@ -436,11 +439,11 @@ def blast_radius(
     up_truncated = down_truncated = False
     if direction in {"up", "both"}:
         upstream, up_truncated = _walk(
-            conn, repo_id, seeds_up, _UPSTREAM_SQL, "up", depth, max_nodes
+            conn, repo_id, seeds_up, _UPSTREAM_SQL, "up", depth_limit, max_nodes
         )
     if direction in {"down", "both"}:
         downstream, down_truncated = _walk(
-            conn, repo_id, seeds_down, _DOWNSTREAM_SQL, "down", depth, max_nodes
+            conn, repo_id, seeds_down, _DOWNSTREAM_SQL, "down", depth_limit, max_nodes
         )
 
     files: dict[str, int] = {}
@@ -462,7 +465,8 @@ def blast_radius(
 
     return {
         "target_id": node_id,
-        "depth": depth,
+        "depth": depth_limit,
+        "depth_label": "all" if depth_limit is None else str(depth_limit),
         "direction": direction,
         "upstream": upstream,
         "downstream": downstream,
@@ -484,7 +488,7 @@ def _walk(
     seeds: dict[str, str],
     sql: str,
     direction: str,
-    depth: int,
+    depth: int | None,
     max_nodes: int,
 ) -> tuple[list[dict[str, Any]], bool]:
     visited: set[str] = set(seeds)
@@ -494,7 +498,7 @@ def _walk(
     entries: list[dict[str, Any]] = []
     while queue:
         current, distance, confidence, current_qname = queue.popleft()
-        if distance >= depth:
+        if depth is not None and distance >= depth:
             continue
         rows = conn.execute(sql, (repo_id, current, max_nodes + 1)).fetchall()
         for row in rows:
@@ -537,8 +541,8 @@ def impact_report(
     conn: sqlite3.Connection,
     target: dict[str, Any],
     neighbor_limit: int = 200,
-    depth: int = 3,
-    max_nodes: int = 200,
+    depth: int | None = None,
+    max_nodes: int = 1000,
     direction: str = "both",
 ) -> dict[str, Any]:
     neighbors = get_neighbors(conn, str(target["id"]), limit=neighbor_limit)
@@ -567,6 +571,7 @@ def impact_report(
             "downstream": stats.get("downstream", 0),
             "entrypoints": stats.get("entrypoints", 0),
             "depth": radius.get("depth", depth),
+            "depth_label": radius.get("depth_label", "all"),
             "direction": direction,
             "truncated": radius.get("truncated", False),
         },

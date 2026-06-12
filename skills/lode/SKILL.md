@@ -118,7 +118,7 @@ change affect", re-index first, then run impact:
 
 ```bash
 lode index "$PWD"
-lode impact "symbol_or_node_id" --repo "$PWD" --depth 3 --direction both --json
+lode impact "symbol_or_node_id" --repo "$PWD" --direction both --json
 ```
 
 The impact report includes:
@@ -135,8 +135,9 @@ Direction flags:
 - `--direction down` shows only dependencies (things the target relies on)
 - `--direction both` (default) shows both
 
-Use `--depth N` (default 3, max 10) to control traversal depth and `--max-nodes N`
-(default 200) to bound result size. If `truncated` is true, increase `--max-nodes`.
+By default, impact traverses the full reachable graph and is bounded by
+`--max-nodes` (default 1000). Use `--depth N` only when you intentionally want a
+shallower, less noisy slice. If `truncated` is true, increase `--max-nodes`.
 
 Read `results[].callers`, `results[].callees`, `results[].files`, and the
 `results[].blast_radius` with `upstream`, `downstream`, and `entrypoints`.

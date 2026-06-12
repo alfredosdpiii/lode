@@ -106,8 +106,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo")
     p.add_argument("--limit", type=int, default=5)
     p.add_argument("--neighbor-limit", type=int, default=200)
-    p.add_argument("--depth", type=int, default=3, help="BFS depth for blast radius (1-10)")
-    p.add_argument("--max-nodes", type=int, default=200, help="Max nodes in blast radius")
+    p.add_argument(
+        "--depth",
+        type=int,
+        help="Optional BFS depth limit for noisy graphs. Omit, or pass 0, for full traversal",
+    )
+    p.add_argument(
+        "--max-nodes",
+        type=int,
+        default=1000,
+        help="Safety cap for nodes in blast radius",
+    )
     p.add_argument(
         "--direction",
         choices=["up", "down", "both"],

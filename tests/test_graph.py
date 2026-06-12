@@ -197,6 +197,21 @@ class BlastRadiusTests(unittest.TestCase):
                 r3 = blast_radius(conn, greet["id"], depth=3, direction="up")
                 self.assertLessEqual(len(r1.get("upstream", [])), len(r3.get("upstream", [])))
 
+    def test_blast_radius_defaults_to_full_reachable_traversal(self) -> None:
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            _write_multi_file_repo(repo)
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                greet = find_symbol(conn, "greet")[0]
+                result = blast_radius(conn, greet["id"], direction="up")
+                qnames = {entry["node"]["qname"] for entry in result["upstream"]}
+                self.assertEqual(result["depth"], None)
+                self.assertEqual(result["depth_label"], "all")
+                self.assertIn("runner.main", qnames)
+
     def test_blast_radius_finds_entrypoints(self) -> None:
         with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
             repo = Path(repo_tmp)
