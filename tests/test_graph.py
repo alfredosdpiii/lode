@@ -150,6 +150,174 @@ class ResolveGraphTests(unittest.TestCase):
                 ).fetchone()[0]
                 self.assertGreaterEqual(resolved, 1)
 
+    def test_ts_js_named_import_calls_resolve(self) -> None:
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "lib.ts").write_text(
+                "export function fn() { return 1; }\n", encoding="utf-8"
+            )
+            (repo / "app.ts").write_text(
+                'import { fn } from "./lib";\n'
+                "export function main() { return fn(); }\n",
+                encoding="utf-8",
+            )
+            stats = index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                fn = find_symbol(conn, "fn")[0]
+                resolved = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND dst = ? "
+                    "AND kind = 'CALLS' AND confidence = 'resolved'",
+                    (stats.repo_id, fn["id"]),
+                ).fetchone()[0]
+                self.assertEqual(resolved, 1)
+
+    def test_python_import_syntaxes_resolve_calls(self) -> None:
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            pkg = repo / "pkg"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text("", encoding="utf-8")
+            (repo / "lib.py").write_text(
+                "def fn():\n    return 1\n", encoding="utf-8"
+            )
+            (pkg / "mod.py").write_text(
+                "def inner():\n    return 2\n", encoding="utf-8"
+            )
+            (pkg / "mod2.py").write_text(
+                "def named():\n    return 3\n", encoding="utf-8"
+            )
+            (repo / "consumer.py").write_text(
+                "import lib\n"
+                "import lib as l\n"
+                "from pkg import mod\n"
+                "from pkg.mod2 import named as alias\n\n"
+                "def caller():\n"
+                "    lib.fn()\n"
+                "    l.fn()\n"
+                "    mod.inner()\n"
+                "    alias()\n",
+                encoding="utf-8",
+            )
+            stats = index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                expected = {"fn": 2, "inner": 1, "named": 1}
+                for name, minimum in expected.items():
+                    target = find_symbol(conn, name)[0]
+                    resolved = conn.execute(
+                        "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND dst = ? "
+                        "AND kind = 'CALLS' AND confidence = 'resolved'",
+                        (stats.repo_id, target["id"]),
+                    ).fetchone()[0]
+                    self.assertGreaterEqual(resolved, minimum, name)
+
+    def test_imports_disambiguate_duplicate_symbol_names(self) -> None:
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "a.py").write_text(
+                "def render():\n    return 'a'\n", encoding="utf-8"
+            )
+            (repo / "b.py").write_text(
+                "def render():\n    return 'b'\n", encoding="utf-8"
+            )
+            (repo / "consumer.py").write_text(
+                "from a import render\n\n"
+                "def caller():\n"
+                "    return render()\n",
+                encoding="utf-8",
+            )
+            stats = index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                a_render = next(
+                    item for item in find_symbol(conn, "render") if item["path"] == "a.py"
+                )
+                b_render = next(
+                    item for item in find_symbol(conn, "render") if item["path"] == "b.py"
+                )
+                a_edges = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND dst = ? "
+                    "AND kind = 'CALLS' AND confidence = 'resolved'",
+                    (stats.repo_id, a_render["id"]),
+                ).fetchone()[0]
+                b_edges = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND dst = ? "
+                    "AND kind = 'CALLS' AND confidence = 'resolved'",
+                    (stats.repo_id, b_render["id"]),
+                ).fetchone()[0]
+                self.assertEqual(a_edges, 1)
+                self.assertEqual(b_edges, 0)
+
+    def test_self_method_resolves_to_containing_class(self) -> None:
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "models.py").write_text(
+                "class A:\n"
+                "    def save(self):\n"
+                "        return 'a'\n"
+                "    def run(self):\n"
+                "        return self.save()\n\n"
+                "class B:\n"
+                "    def save(self):\n"
+                "        return 'b'\n",
+                encoding="utf-8",
+            )
+            stats = index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                run = next(
+                    item for item in find_symbol(conn, "run") if item["qname"] == "models.A.run"
+                )
+                a_save = next(
+                    item for item in find_symbol(conn, "save") if item["qname"] == "models.A.save"
+                )
+                b_save = next(
+                    item for item in find_symbol(conn, "save") if item["qname"] == "models.B.save"
+                )
+                a_edges = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND src = ? AND dst = ? "
+                    "AND kind = 'CALLS' AND confidence = 'resolved'",
+                    (stats.repo_id, run["id"], a_save["id"]),
+                ).fetchone()[0]
+                b_edges = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND src = ? AND dst = ? "
+                    "AND kind = 'CALLS' AND confidence = 'resolved'",
+                    (stats.repo_id, run["id"], b_save["id"]),
+                ).fetchone()[0]
+                self.assertEqual(a_edges, 1)
+                self.assertEqual(b_edges, 0)
+
+    def test_duplicate_methods_do_not_resolve_by_bare_name(self) -> None:
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "models.py").write_text(
+                "class A:\n"
+                "    def save(self):\n"
+                "        return 'a'\n\n"
+                "class B:\n"
+                "    def save(self):\n"
+                "        return 'b'\n\n"
+                "def caller(obj):\n"
+                "    return obj.save()\n",
+                encoding="utf-8",
+            )
+            stats = index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                caller = find_symbol(conn, "caller")[0]
+                resolved = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND src = ? "
+                    "AND kind = 'CALLS' AND confidence = 'resolved'",
+                    (stats.repo_id, caller["id"]),
+                ).fetchone()[0]
+                self.assertEqual(resolved, 0)
+
 
 class BlastRadiusTests(unittest.TestCase):
     def test_blast_radius_traverses_upstream(self) -> None:
@@ -271,6 +439,26 @@ class BlastRadiusTests(unittest.TestCase):
                 result = blast_radius(conn, "nonexistent_id", depth=3)
                 self.assertEqual(result, {})
 
+    def test_blast_radius_labels_file_import_expansion(self) -> None:
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            _write_multi_file_repo(repo)
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                greet = find_symbol(conn, "greet")[0]
+                result = blast_radius(conn, greet["id"], direction="up")
+                entries = result.get("upstream", [])
+                self.assertTrue(
+                    any(
+                        entry["via"] == "IMPORTS"
+                        and entry["scope"] == "conservative_file"
+                        for entry in entries
+                    ),
+                    entries,
+                )
+
 
 class ImpactReportTests(unittest.TestCase):
     def test_impact_report_includes_blast_radius(self) -> None:
@@ -318,6 +506,30 @@ class ImpactReportTests(unittest.TestCase):
                 )
                 self.assertEqual(len(targets), 1)
                 self.assertEqual(targets[0]["id"], greet["id"])
+
+    def test_impact_report_filters_resolved_external_placeholder(self) -> None:
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "lib.py").write_text(
+                "def fn():\n    return 1\n", encoding="utf-8"
+            )
+            (repo / "consumer.py").write_text(
+                "from lib import fn\n\n"
+                "def caller():\n"
+                "    return fn()\n",
+                encoding="utf-8",
+            )
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                caller = find_symbol(conn, "caller")[0]
+                report = impact_report(conn, caller, depth=1, direction="down")
+                callee_kinds = {
+                    item["node"]["kind"] for item in report["callees"] if item["node"]
+                }
+                self.assertIn("Function", callee_kinds)
+                self.assertNotIn("ExternalSymbol", callee_kinds)
 
 
 if __name__ == "__main__":

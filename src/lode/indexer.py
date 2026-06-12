@@ -166,7 +166,9 @@ def parse_file(root: Path, path: Path, digest: str | None = None) -> FileIndex:
     if language == "python":
         extra_nodes, extra_edges, import_bindings = parse_python(rel, text, file_node.id)
     elif language in {"typescript", "javascript"}:
-        extra_nodes, extra_edges, import_bindings = parse_ts_js(rel, text, file_node.id, language)
+        extra_nodes, extra_edges, import_bindings = parse_ts_js(
+            rel, text, file_node.id, language
+        )
     elif language == "markdown":
         extra_nodes, extra_edges = parse_markdown(rel, text, file_node.id)
         import_bindings = []
@@ -275,7 +277,7 @@ def parse_python(
             doc=str(exc),
             confidence="exact",
         )
-        return [node], [Edge(file_node_id, node.id, "HAS_PARSE_ERROR", "exact")]
+        return [node], [Edge(file_node_id, node.id, "HAS_PARSE_ERROR", "exact")], []
 
     symbol_by_name: dict[str, str] = {}
     for item in tree.body:
@@ -314,7 +316,6 @@ def parse_python(
                         f"{module}.{item.name}", rel, child, text, kind="Method"
                     )
                     nodes.append(method)
-                    symbol_by_name[child.name] = method.id
                     edges.append(Edge(class_node.id, method.id, "CONTAINS", "exact"))
                     edges.append(Edge(file_node_id, method.id, "DEFINES", "exact"))
                     route_nodes, route_edges = route_facts_for_python(
@@ -323,15 +324,12 @@ def parse_python(
                     nodes.extend(route_nodes)
                     edges.extend(route_edges)
 
-    import_bindings: list[dict[str, Any]] = []
     for item in ast.walk(tree):
         if isinstance(item, ast.Import):
             for alias in item.names:
                 module = alias.name
                 import_bindings.append(
-                    {"module": module, "name": None, "alias": None}
-                    if alias.asname is None
-                    else {"module": module, "name": alias.name, "alias": alias.asname}
+                    {"module": module, "name": None, "alias": alias.asname}
                 )
                 dep = external_node("ExternalDependency", module, rel)
                 nodes.append(dep)
@@ -342,7 +340,9 @@ def parse_python(
                 module = "." * item.level + module
             for alias in item.names:
                 if alias.name == "*":
-                    import_bindings.append({"module": module, "name": "*", "alias": None})
+                    import_bindings.append(
+                        {"module": module, "name": "*", "alias": None}
+                    )
                 elif alias.asname:
                     import_bindings.append(
                         {"module": module, "name": alias.name, "alias": alias.asname}
@@ -364,8 +364,7 @@ def parse_python(
         caller_id = enclosing_node_for_line(function_stack, getattr(call, "lineno", 0))
         if not caller_id:
             continue
-        local_name = call_name.split(".")[-1]
-        target_id = symbol_by_name.get(local_name)
+        target_id = symbol_by_name.get(call_name) if "." not in call_name else None
         if target_id:
             edges.append(Edge(caller_id, target_id, "CALLS", "strong", call_name))
         else:
@@ -521,7 +520,6 @@ def parse_ts_js(
     module = module_qname(rel)
     lines = text.splitlines()
 
-    import_bindings: list[dict[str, Any]] = []
     for match in re.finditer(
         r"import\s+(.*?)\s+from\s+(['\"])([^'\"]+)\2", text
     ):
@@ -622,15 +620,30 @@ def parse_ts_js(
         caller_id = enclosing_node_for_line(function_ranges, line_no)
         if not caller_id:
             continue
-        for call_name in re.findall(r"\b([A-Za-z_$][\w$]*)\s*\(", line):
-            if call_name in {"if", "for", "while", "switch", "return", "function"}:
+        for call_name in re.findall(
+            r"\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\(", line
+        ):
+            first_segment = call_name.split(".", 1)[0]
+            if first_segment in {
+                "if",
+                "for",
+                "while",
+                "switch",
+                "return",
+                "function",
+            }:
                 continue
-            target_id = symbol_by_name.get(call_name)
-            if target_id and target_id != caller_id:
-                edges.append(
-                    Edge(caller_id, target_id, "CALLS", "heuristic", call_name)
-                )
-    return nodes, edges
+            target_id = symbol_by_name.get(call_name) if "." not in call_name else None
+            if target_id:
+                if target_id != caller_id:
+                    edges.append(
+                        Edge(caller_id, target_id, "CALLS", "heuristic", call_name)
+                    )
+                continue
+            target = external_node("ExternalSymbol", call_name, rel)
+            nodes.append(target)
+            edges.append(Edge(caller_id, target.id, "CALLS", "heuristic", call_name))
+    return nodes, edges, import_bindings
 
 
 def find_block_end(lines: list[str], start_line: int) -> int:

@@ -92,9 +92,15 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
     by_qname = {row["qname"]: row for row in def_rows}
     by_name: dict[str, list[sqlite3.Row]] = {}
     defs_by_file: dict[str, dict[str, list[sqlite3.Row]]] = {}
+    methods_by_class: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
     for row in def_rows:
         by_name.setdefault(row["name"], []).append(row)
         defs_by_file.setdefault(row["path"], {}).setdefault(row["name"], []).append(row)
+        if row["kind"] == "Method" and "." in row["qname"]:
+            class_qname = row["qname"].rsplit(".", 1)[0]
+            methods_by_class.setdefault(
+                (row["path"], class_qname, row["name"]), []
+            ).append(row)
 
     module_cache: dict[tuple[str, str], str | None] = {}
 
@@ -126,54 +132,70 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
         bindings = imports_by_path.get(caller_path)
         if not bindings:
             return None
-        alias_map: dict[str, tuple[str, str | None]] = {}
+        alias_map: dict[str, list[tuple[str, str | None]]] = {}
         star_modules: list[str] = []
+
+        def add_alias(alias: str | None, module: str, name: str | None) -> None:
+            alias = (alias or "").strip()
+            if alias:
+                alias_map.setdefault(alias, []).append((module, name))
+
         for binding in bindings:
             module = str(binding.get("module") or "").strip()
             if not module:
                 continue
-            name = binding.get("name")
+            raw_name = binding.get("name")
+            name = str(raw_name).strip() if raw_name is not None else None
             if name == "*":
                 star_modules.append(module)
                 continue
-            alias = binding.get("alias")
+            alias = str(binding.get("alias") or "").strip()
             if alias:
-                alias_map[str(alias)] = (module, name)
+                add_alias(alias, module, name)
+            elif name not in (None, "", "default"):
+                add_alias(name, module, name)
+            else:
+                add_alias(module, module, None)
 
         segments = dotted.split(".")
         for index in range(len(segments), 0, -1):
             prefix = ".".join(segments[:index])
             if prefix not in alias_map:
                 continue
-            module, name = alias_map[prefix]
             remainder = segments[index:]
-            if name in (None, ""):
-                if remainder:
-                    row = pick_def(
-                        resolve_module(module, caller_path), remainder[0], prefer
-                    )
-                    if row is not None:
-                        return row
-            elif name == "default":
-                symbol = remainder[0] if remainder else prefix
-                row = pick_def(resolve_module(module, caller_path), symbol, prefer)
-                if row is not None:
-                    return row
-            else:
-                if remainder:
-                    submodule = join_module_name(module, str(name))
-                    row = pick_def(
-                        resolve_module(submodule, caller_path), remainder[0], prefer
-                    )
-                    if row is None:
+            found: dict[str, sqlite3.Row] = {}
+            for module, name in alias_map[prefix]:
+                row: sqlite3.Row | None = None
+                if name in (None, ""):
+                    if remainder:
                         row = pick_def(
                             resolve_module(module, caller_path), remainder[0], prefer
                         )
+                elif name == "default":
+                    symbol = remainder[0] if remainder else prefix
+                    row = pick_def(resolve_module(module, caller_path), symbol, prefer)
                 else:
-                    row = pick_def(resolve_module(module, caller_path), str(name), prefer)
+                    if remainder:
+                        submodule = join_module_name(module, name)
+                        row = pick_def(
+                            resolve_module(submodule, caller_path),
+                            remainder[0],
+                            prefer,
+                        )
+                        if row is None:
+                            row = pick_def(
+                                resolve_module(module, caller_path),
+                                remainder[0],
+                                prefer,
+                            )
+                    else:
+                        row = pick_def(resolve_module(module, caller_path), name, prefer)
                 if row is not None:
-                    return row
-            break
+                    found[row["id"]] = row
+            if len(found) == 1:
+                return next(iter(found.values()))
+            if found:
+                return None
 
         if len(segments) == 1 and star_modules:
             found: dict[str, sqlite3.Row] = {}
@@ -185,8 +207,28 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
                 return next(iter(found.values()))
         return None
 
+    def resolve_self_or_class_method(
+        caller: sqlite3.Row | None, dotted: str, prefer: tuple[str, ...]
+    ) -> sqlite3.Row | None:
+        if caller is None:
+            return None
+        segments = dotted.split(".")
+        if len(segments) != 2 or segments[0] not in {"self", "cls", "this"}:
+            return None
+        if caller["caller_kind"] != "Method" or "." not in caller["caller_qname"]:
+            return None
+        class_qname = caller["caller_qname"].rsplit(".", 1)[0]
+        rows = methods_by_class.get(
+            (caller["caller_path"], class_qname, segments[1]), []
+        )
+        pool = [row for row in rows if row["kind"] in prefer] or rows
+        return pool[0] if len(pool) == 1 else None
+
     def resolve_target(
-        caller_path: str, dotted: str, prefer: tuple[str, ...]
+        caller_path: str,
+        dotted: str,
+        prefer: tuple[str, ...],
+        caller: sqlite3.Row | None = None,
     ) -> sqlite3.Row | None:
         dotted = (dotted or "").strip()
         if not dotted:
@@ -194,6 +236,9 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
         exact = by_qname.get(dotted)
         if exact is not None:
             return exact
+        row = resolve_self_or_class_method(caller, dotted, prefer)
+        if row is not None:
+            return row
         if dotted.split(".")[0] in {"self", "cls", "this"}:
             return None
         row = resolve_via_imports(caller_path, dotted, prefer)
@@ -254,9 +299,13 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
         unresolved_calls = list(
             conn.execute(
                 """
-                SELECT e.owner_path, e.src, e.detail, target.name AS target_name
+                SELECT e.owner_path, e.src, e.detail, target.name AS target_name,
+                       caller.kind AS caller_kind,
+                       caller.qname AS caller_qname,
+                       caller.path AS caller_path
                 FROM edges e
                 JOIN nodes target ON target.repo_id = e.repo_id AND target.id = e.dst
+                JOIN nodes caller ON caller.repo_id = e.repo_id AND caller.id = e.src
                 WHERE e.repo_id = ?
                   AND e.kind = 'CALLS'
                   AND target.kind = 'ExternalSymbol'
@@ -266,7 +315,9 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
         )
         for edge in unresolved_calls:
             call_name = (edge["detail"] or edge["target_name"] or "").strip()
-            row = resolve_target(edge["owner_path"], call_name, CALLABLE_KINDS)
+            row = resolve_target(
+                edge["owner_path"], call_name, CALLABLE_KINDS, caller=edge
+            )
             if row is None or row["id"] == edge["src"]:
                 continue
             result = conn.execute(
@@ -382,6 +433,10 @@ def weakest_confidence(left: str | None, right: str | None) -> str:
     return RANK_CONFIDENCE[rank]
 
 
+def edge_scope(edge_kind: str) -> str:
+    return "conservative_file" if edge_kind == "IMPORTS" else "precise_symbol"
+
+
 def compact_radius_node(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -462,6 +517,11 @@ def blast_radius(
         for path, distance in sorted(files.items(), key=lambda item: (item[1], item[0]))
     ]
     entrypoints = [entry for entry in upstream if entry["node"]["kind"] == "Route"]
+    conservative_file_expansions = sum(
+        1
+        for entry in [*upstream, *downstream]
+        if entry.get("scope") == "conservative_file"
+    )
 
     return {
         "target_id": node_id,
@@ -478,8 +538,60 @@ def blast_radius(
             "downstream": len(downstream),
             "files": len(file_entries),
             "entrypoints": len(entrypoints),
+            "conservative_file_expansions": conservative_file_expansions,
         },
     }
+
+
+def _call_detail(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def filter_shadowed_external_call_rows(
+    rows: list[sqlite3.Row],
+) -> list[sqlite3.Row]:
+    resolved_details = {
+        _call_detail(row["edge_detail"])
+        for row in rows
+        if row["edge_kind"] == "CALLS"
+        and row["kind"] not in {"ExternalSymbol", "ExternalDependency"}
+        and _call_detail(row["edge_detail"])
+    }
+    if not resolved_details:
+        return rows
+    return [
+        row
+        for row in rows
+        if not (
+            row["edge_kind"] == "CALLS"
+            and row["kind"] == "ExternalSymbol"
+            and _call_detail(row["edge_detail"]) in resolved_details
+        )
+    ]
+
+
+def filter_shadowed_external_call_neighbors(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    resolved_details = {
+        _call_detail(item["edge"].get("detail"))
+        for item in items
+        if item.get("edge", {}).get("kind") == "CALLS"
+        and (item.get("node") or {}).get("kind")
+        not in {"ExternalSymbol", "ExternalDependency"}
+        and _call_detail(item["edge"].get("detail"))
+    }
+    if not resolved_details:
+        return items
+    return [
+        item
+        for item in items
+        if not (
+            item.get("edge", {}).get("kind") == "CALLS"
+            and (item.get("node") or {}).get("kind") == "ExternalSymbol"
+            and _call_detail(item["edge"].get("detail")) in resolved_details
+        )
+    ]
 
 
 def _walk(
@@ -500,7 +612,9 @@ def _walk(
         current, distance, confidence, current_qname = queue.popleft()
         if depth is not None and distance >= depth:
             continue
-        rows = conn.execute(sql, (repo_id, current, max_nodes + 1)).fetchall()
+        rows = filter_shadowed_external_call_rows(
+            conn.execute(sql, (repo_id, current, max_nodes + 1)).fetchall()
+        )
         for row in rows:
             other = row["id"]
             if other in visited:
@@ -518,6 +632,7 @@ def _walk(
                     "via_qname": current_qname,
                     "detail": row["edge_detail"] or "",
                     "confidence": combined,
+                    "scope": edge_scope(row["edge_kind"]),
                 }
             )
             if row["kind"] in EXPANDABLE_NODE_KINDS:
@@ -546,8 +661,8 @@ def impact_report(
     direction: str = "both",
 ) -> dict[str, Any]:
     neighbors = get_neighbors(conn, str(target["id"]), limit=neighbor_limit)
-    incoming = neighbors["incoming"]
-    outgoing = neighbors["outgoing"]
+    incoming = filter_shadowed_external_call_neighbors(neighbors["incoming"])
+    outgoing = filter_shadowed_external_call_neighbors(neighbors["outgoing"])
     callers = [item for item in incoming if item["edge"]["kind"] == "CALLS"]
     callees = [item for item in outgoing if item["edge"]["kind"] == "CALLS"]
     radius = blast_radius(
