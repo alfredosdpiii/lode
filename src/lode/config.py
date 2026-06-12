@@ -28,4 +28,3 @@ def repo_id_for_root(root: Path) -> str:
 
     resolved = str(root.expanduser().resolve())
     return hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:16]
-

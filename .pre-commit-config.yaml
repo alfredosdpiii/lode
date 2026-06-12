@@ -1,0 +1,38 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --check .
+        language: system
+        pass_filenames: false
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check .
+        language: system
+        pass_filenames: false
+      - id: mypy
+        name: mypy
+        entry: uv run mypy src tests scripts benchmarks
+        language: system
+        pass_filenames: false
+      - id: large-files
+        name: large file guard
+        entry: uv run python scripts/check_large_files.py
+        language: system
+        pass_filenames: false
+      - id: linked-todos
+        name: linked TODO/FIXME guard
+        entry: uv run python scripts/check_todos.py
+        language: system
+        pass_filenames: false
+      - id: agents-md
+        name: AGENTS.md guard
+        entry: uv run python scripts/check_agents_md.py
+        language: system
+        pass_filenames: false
+      - id: duplicate-code
+        name: duplicate code guard
+        entry: uv run python scripts/check_duplicate_code.py
+        language: system
+        pass_filenames: false

@@ -81,6 +81,8 @@ class LodeEndToEndTests(unittest.TestCase):
             try:
                 base = f"http://127.0.0.1:{port}"
                 wait_for_json(base + "/health")
+                metrics = get_text(base + "/metrics")
+                self.assertIn("loded_requests_total", metrics)
                 api_index = post_json(base + "/index", {"path": str(repo)})
                 self.assertTrue(api_index["ok"])
                 api_status = get_json(base + "/status")
@@ -111,9 +113,7 @@ class LodeEndToEndTests(unittest.TestCase):
             env.update(
                 {
                     "LODE_DATA_DIR_HOST": str(data_dir),
-                    "LODE_HF_CACHE_DIR": str(
-                        Path.home() / ".cache" / "lode" / "hf-arctic-s"
-                    ),
+                    "LODE_HF_CACHE_DIR": str(Path.home() / ".cache" / "lode" / "hf-arctic-s"),
                     "LODE_REPOS_DIR": str(PROJECT_ROOT.parent),
                     "LODE_UID": str(os.getuid()),
                     "LODE_GID": str(os.getgid()),
@@ -134,9 +134,7 @@ class LodeEndToEndTests(unittest.TestCase):
 
                 api_index = post_json("http://127.0.0.1:7979/index", {"path": "/app"})
                 self.assertTrue(api_index["ok"])
-                api_search = get_json(
-                    "http://127.0.0.1:7979/search?q=build_context_pack"
-                )
+                api_search = get_json("http://127.0.0.1:7979/search?q=build_context_pack")
                 self.assertTrue(api_search["results"])
 
                 embed = run_lode(
@@ -188,6 +186,11 @@ def get_json(url: str, timeout: float = 10) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def get_text(url: str, timeout: float = 10) -> str:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return response.read().decode("utf-8")
+
+
 def post_json(url: str, payload: dict, timeout: float = 30) -> dict:
     request = urllib.request.Request(
         url,
@@ -223,9 +226,7 @@ def wait_for_embeddings(url: str, timeout: float = 120) -> list[list[float]]:
         try:
             request = urllib.request.Request(
                 url,
-                data=json.dumps({"inputs": ["hello world", "repository graph"]}).encode(
-                    "utf-8"
-                ),
+                data=json.dumps({"inputs": ["hello world", "repository graph"]}).encode("utf-8"),
                 headers={"content-type": "application/json"},
                 method="POST",
             )

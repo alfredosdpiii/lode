@@ -1,0 +1,138 @@
+openapi: 3.1.0
+info:
+  title: loded local daemon API
+  version: 0.1.2
+  description: Local-first API for indexing and querying repository knowledge graphs.
+servers:
+  - url: http://127.0.0.1:7979
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Daemon is healthy.
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        "200":
+          description: Text metrics for local daemon requests.
+  /status:
+    get:
+      summary: Repository status
+      responses:
+        "200":
+          description: Indexed repository metadata.
+  /search:
+    get:
+      summary: Search indexed nodes
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Search results.
+    post:
+      summary: Search indexed nodes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query:
+                  type: string
+                repo:
+                  type: string
+                limit:
+                  type: integer
+      responses:
+        "200":
+          description: Search results.
+  /index:
+    post:
+      summary: Index a repository path
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+      responses:
+        "200":
+          description: Indexing stats.
+  /context:
+    post:
+      summary: Build an agent context pack
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query:
+                  type: string
+                repo:
+                  type: string
+                budget:
+                  type: integer
+                limit:
+                  type: integer
+      responses:
+        "200":
+          description: Context pack.
+  /impact:
+    get:
+      summary: Compute impact for a target
+      parameters:
+        - name: target
+          in: query
+          schema:
+            type: string
+        - name: direction
+          in: query
+          schema:
+            type: string
+            enum: [up, down, both]
+      responses:
+        "200":
+          description: Impact report.
+    post:
+      summary: Compute impact for a target
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target]
+              properties:
+                target:
+                  type: string
+                repo:
+                  type: string
+                direction:
+                  type: string
+                  enum: [up, down, both]
+                depth:
+                  type: integer
+                max_nodes:
+                  type: integer
+      responses:
+        "200":
+          description: Impact report.

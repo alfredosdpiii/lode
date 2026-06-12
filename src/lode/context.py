@@ -152,4 +152,3 @@ def truncate(value: str, length: int) -> str:
 def context_rank(node: dict[str, Any]) -> tuple[int, float, str]:
     kind_penalty = 1 if node.get("kind") in {"ExternalSymbol", "ExternalDependency"} else 0
     return (kind_penalty, float(node.get("rank") or 0.0), node.get("qname") or "")
-

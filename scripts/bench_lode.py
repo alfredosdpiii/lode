@@ -125,9 +125,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         data_dir = Path(temp_dir.name)
 
     try:
-        cold_stats, cold_index_ms = timed(
-            lambda: index_repo(repo, sqlite_path(data_dir))
-        )
+        cold_stats, cold_index_ms = timed(lambda: index_repo(repo, sqlite_path(data_dir)))
         hot_stats, hot_index_ms = timed(lambda: index_repo(repo, sqlite_path(data_dir)))
 
         with closing(connect(sqlite_path(data_dir))) as conn:
@@ -159,9 +157,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             if args.include_kuzu:
                 result["kuzu"] = benchmark_kuzu(conn, data_dir)
             if args.embed_url:
-                result["embeddings"] = benchmark_embeddings(
-                    conn, args.embed_url, args.embed_limit
-                )
+                result["embeddings"] = benchmark_embeddings(conn, args.embed_url, args.embed_limit)
                 result["database_after_embeddings"] = database_metrics(conn, data_dir)
         return result
     finally:
@@ -177,9 +173,12 @@ def benchmark_search(
         last_results: list[dict[str, Any]] = []
         timings = []
         for _ in range(repeat):
-            last_results, elapsed = timed(
-                lambda query=query: search_nodes(conn, query, limit=limit)
-            )
+            current_query = query
+
+            def run_search() -> list[dict[str, Any]]:
+                return search_nodes(conn, current_query, limit=limit)
+
+            last_results, elapsed = timed(run_search)
             timings.append(elapsed)
         out[query] = {
             "timing_ms": summarize_timings(timings),
@@ -197,9 +196,12 @@ def benchmark_symbols(
         last_results: list[dict[str, Any]] = []
         timings = []
         for _ in range(repeat):
-            last_results, elapsed = timed(
-                lambda symbol=symbol: find_symbol(conn, symbol, limit=limit)
-            )
+            current_symbol = symbol
+
+            def run_symbol_lookup() -> list[dict[str, Any]]:
+                return find_symbol(conn, current_symbol, limit=limit)
+
+            last_results, elapsed = timed(run_symbol_lookup)
             timings.append(elapsed)
         out[symbol] = {
             "timing_ms": summarize_timings(timings),
@@ -221,11 +223,12 @@ def benchmark_context(
         last_pack: dict[str, Any] = {}
         timings = []
         for _ in range(repeat):
-            last_pack, elapsed = timed(
-                lambda query=query: build_context_pack(
-                    conn, query, budget=budget, limit=limit
-                )
-            )
+            current_query = query
+
+            def run_context() -> dict[str, Any]:
+                return build_context_pack(conn, current_query, budget=budget, limit=limit)
+
+            last_pack, elapsed = timed(run_context)
             timings.append(elapsed)
         out[query] = {
             "timing_ms": summarize_timings(timings),

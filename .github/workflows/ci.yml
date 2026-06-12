@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --extra kuzu --dev
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy src tests scripts benchmarks
+
+      - name: Test with coverage and timing
+        run: |
+          start=$(date +%s)
+          uv run coverage run -m unittest discover -s tests -v
+          end=$(date +%s)
+          echo "test_duration_seconds=$((end - start))" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Coverage gate
+        run: uv run coverage report
+
+      - name: Complexity gate
+        run: uv run radon cc src tests scripts -s -n B
+
+      - name: Dead code gate
+        run: uv run vulture src tests scripts --min-confidence 90
+
+      - name: Dependency hygiene
+        run: uv run deptry .
+
+      - name: Security checks
+        run: |
+          uv run bandit -c pyproject.toml -r src scripts -q
+          uv run pip-audit --desc off
+
+      - name: Repository policy checks
+        run: |
+          uv run python scripts/check_large_files.py
+          uv run python scripts/check_todos.py
+          uv run python scripts/check_agents_md.py
+          uv run python scripts/check_feature_flags.py
+          uv run python scripts/check_duplicate_code.py
+          uv run python scripts/generate_openapi_docs.py --check

@@ -74,9 +74,7 @@ class IndexStats:
 def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
     root = repo_path.expanduser().resolve()
     if not root.exists() or not root.is_dir():
-        raise FileNotFoundError(
-            f"Repository path does not exist or is not a directory: {root}"
-        )
+        raise FileNotFoundError(f"Repository path does not exist or is not a directory: {root}")
     conn = connect(db_path)
     try:
         repo_id = upsert_repo(conn, root)
@@ -148,9 +146,7 @@ def parse_file(root: Path, path: Path, digest: str | None = None) -> FileIndex:
     rel = path.relative_to(root).as_posix()
     language = SOURCE_EXTENSIONS.get(path.suffix.lower(), "text")
     text = path.read_text(encoding="utf-8", errors="replace")
-    content_hash = (
-        digest or hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
-    )
+    content_hash = digest or hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
     file_node = make_node(
         "File",
         Path(rel).name,
@@ -166,9 +162,7 @@ def parse_file(root: Path, path: Path, digest: str | None = None) -> FileIndex:
     if language == "python":
         extra_nodes, extra_edges, import_bindings = parse_python(rel, text, file_node.id)
     elif language in {"typescript", "javascript"}:
-        extra_nodes, extra_edges, import_bindings = parse_ts_js(
-            rel, text, file_node.id, language
-        )
+        extra_nodes, extra_edges, import_bindings = parse_ts_js(rel, text, file_node.id, language)
     elif language == "markdown":
         extra_nodes, extra_edges = parse_markdown(rel, text, file_node.id)
         import_bindings = []
@@ -286,9 +280,7 @@ def parse_python(
             nodes.append(node)
             symbol_by_name[item.name] = node.id
             edges.append(Edge(file_node_id, node.id, "DEFINES", "exact"))
-            route_nodes, route_edges = route_facts_for_python(
-                item, node, rel, file_node_id
-            )
+            route_nodes, route_edges = route_facts_for_python(item, node, rel, file_node_id)
             nodes.extend(route_nodes)
             edges.extend(route_edges)
         elif isinstance(item, ast.ClassDef):
@@ -324,33 +316,29 @@ def parse_python(
                     nodes.extend(route_nodes)
                     edges.extend(route_edges)
 
-    for item in ast.walk(tree):
-        if isinstance(item, ast.Import):
-            for alias in item.names:
-                module = alias.name
+    for import_node in ast.walk(tree):
+        if isinstance(import_node, ast.Import):
+            for alias in import_node.names:
+                import_module = alias.name
                 import_bindings.append(
-                    {"module": module, "name": None, "alias": alias.asname}
+                    {"module": import_module, "name": None, "alias": alias.asname}
                 )
-                dep = external_node("ExternalDependency", module, rel)
+                dep = external_node("ExternalDependency", import_module, rel)
                 nodes.append(dep)
-                edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", module))
-        elif isinstance(item, ast.ImportFrom):
-            module = item.module or ""
-            if item.level:
-                module = "." * item.level + module
-            for alias in item.names:
+                edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", import_module))
+        elif isinstance(import_node, ast.ImportFrom):
+            module = import_node.module or ""
+            if import_node.level:
+                module = "." * import_node.level + module
+            for alias in import_node.names:
                 if alias.name == "*":
-                    import_bindings.append(
-                        {"module": module, "name": "*", "alias": None}
-                    )
+                    import_bindings.append({"module": module, "name": "*", "alias": None})
                 elif alias.asname:
                     import_bindings.append(
                         {"module": module, "name": alias.name, "alias": alias.asname}
                     )
                 else:
-                    import_bindings.append(
-                        {"module": module, "name": alias.name, "alias": None}
-                    )
+                    import_bindings.append({"module": module, "name": alias.name, "alias": None})
             if module:
                 dep = external_node("ExternalDependency", module, rel)
                 nodes.append(dep)
@@ -502,9 +490,7 @@ def build_python_function_ranges(nodes: list[Node]) -> list[tuple[int, int, str]
     return sorted(ranges, key=lambda item: (item[1] - item[0], item[0]))
 
 
-def enclosing_node_for_line(
-    ranges: list[tuple[int, int, str]], line: int
-) -> str | None:
+def enclosing_node_for_line(ranges: list[tuple[int, int, str]], line: int) -> str | None:
     for start, end, node_id in ranges:
         if start <= line <= end:
             return node_id
@@ -520,9 +506,7 @@ def parse_ts_js(
     module = module_qname(rel)
     lines = text.splitlines()
 
-    for match in re.finditer(
-        r"import\s+(.*?)\s+from\s+(['\"])([^'\"]+)\2", text
-    ):
+    for match in re.finditer(r"import\s+(.*?)\s+from\s+(['\"])([^'\"]+)\2", text):
         clause = match.group(1).strip()
         mod = match.group(3)
         for part in _split_import_clause(clause):
@@ -542,9 +526,7 @@ def parse_ts_js(
         ("Class", re.compile(r"(?:export\s+)?class\s+([A-Za-z_$][\w$]*)")),
         (
             "Function",
-            re.compile(
-                r"(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)"
-            ),
+            re.compile(r"(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)"),
         ),
         (
             "Function",
@@ -561,10 +543,10 @@ def parse_ts_js(
     ]
     for line_no, line in enumerate(lines, start=1):
         for kind, pattern in patterns:
-            match = pattern.search(line)
-            if not match:
+            symbol_match = pattern.search(line)
+            if not symbol_match:
                 continue
-            name = match.group(1)
+            name = symbol_match.group(1)
             end = find_block_end(lines, line_no)
             signature = line.strip()[:240]
             body = "\n".join(lines[line_no - 1 : end])
@@ -612,17 +594,13 @@ def parse_ts_js(
                 edges.append(Edge(route.id, target_id, "HANDLES", "heuristic", handler))
 
     function_ranges = [
-        (node.start_line, node.end_line, node.id)
-        for node in nodes
-        if node.kind == "Function"
+        (node.start_line, node.end_line, node.id) for node in nodes if node.kind == "Function"
     ]
     for line_no, line in enumerate(lines, start=1):
         caller_id = enclosing_node_for_line(function_ranges, line_no)
         if not caller_id:
             continue
-        for call_name in re.findall(
-            r"\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\(", line
-        ):
+        for call_name in re.findall(r"\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\(", line):
             first_segment = call_name.split(".", 1)[0]
             if first_segment in {
                 "if",
@@ -636,9 +614,7 @@ def parse_ts_js(
             target_id = symbol_by_name.get(call_name) if "." not in call_name else None
             if target_id:
                 if target_id != caller_id:
-                    edges.append(
-                        Edge(caller_id, target_id, "CALLS", "heuristic", call_name)
-                    )
+                    edges.append(Edge(caller_id, target_id, "CALLS", "heuristic", call_name))
                 continue
             target = external_node("ExternalSymbol", call_name, rel)
             nodes.append(target)
@@ -660,9 +636,7 @@ def find_block_end(lines: list[str], start_line: int) -> int:
     return start_line
 
 
-def parse_markdown(
-    rel: str, text: str, file_node_id: str
-) -> tuple[list[Node], list[Edge]]:
+def parse_markdown(rel: str, text: str, file_node_id: str) -> tuple[list[Node], list[Edge]]:
     nodes: list[Node] = []
     edges: list[Edge] = []
     headings = list(re.finditer(r"^(#{1,6})\s+(.+?)\s*$", text, re.MULTILINE))
@@ -709,9 +683,7 @@ def parse_config(
 
 
 def external_node(kind: str, name: str, rel: str) -> Node:
-    return make_node(
-        kind, name, f"external:{name}", rel, 0, 0, name, confidence="heuristic"
-    )
+    return make_node(kind, name, f"external:{name}", rel, 0, 0, name, confidence="heuristic")
 
 
 def slice_lines(text: str, start: int, end: int) -> str:

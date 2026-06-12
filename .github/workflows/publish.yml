@@ -8,7 +8,7 @@ name: Publish Python package
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   publish:
@@ -18,7 +18,7 @@ jobs:
       name: pypi
       url: https://pypi.org/p/lode-kg
     permissions:
-      contents: read
+      contents: write
       id-token: write
     steps:
       - name: Check out repository
@@ -42,6 +42,14 @@ jobs:
         run: >
           uv run --isolated --no-project --with dist/*.tar.gz
           python tests/smoke_test.py
+
+      - name: Generate GitHub release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release view "${GITHUB_REF_NAME}" ||
+          gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes
 
       - name: Publish to PyPI
         run: uv publish

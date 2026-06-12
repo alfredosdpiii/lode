@@ -48,9 +48,7 @@ class LodeIndexTests(unittest.TestCase):
                 self.assertTrue(any(row["kind"] == "Route" for row in routes))
 
                 neighbors = get_neighbors(conn, functions[0]["id"])
-                outgoing_edges = {
-                    item["edge"]["kind"] for item in neighbors["outgoing"]
-                }
+                outgoing_edges = {item["edge"]["kind"] for item in neighbors["outgoing"]}
                 self.assertIn("CALLS", outgoing_edges)
 
                 context = build_context_pack(conn, "create user route", budget=2000)
@@ -81,9 +79,7 @@ class LodeIndexTests(unittest.TestCase):
                 symbols = find_symbol(conn, "long_symbol_name")
                 self.assertTrue(symbols)
                 self.assertEqual(symbols[0]["kind"], "Function")
-                self.assertEqual(
-                    symbols[0]["qname"], "nested.deep.module.long_symbol_name"
-                )
+                self.assertEqual(symbols[0]["qname"], "nested.deep.module.long_symbol_name")
 
     def test_neighbors_include_cross_file_callers_after_reindex(self) -> None:
         with (
@@ -125,9 +121,7 @@ class LodeIndexTests(unittest.TestCase):
                 neighbors = get_neighbors(conn, target["id"])
                 self.assert_has_resolved_caller(neighbors, "caller.call_target")
 
-    def assert_has_resolved_caller(
-        self, neighbors: dict[str, Any], caller_qname: str
-    ) -> None:
+    def assert_has_resolved_caller(self, neighbors: dict[str, Any], caller_qname: str) -> None:
         incoming = neighbors["incoming"]
         self.assertTrue(
             any(
@@ -255,9 +249,7 @@ class LodeIndexTests(unittest.TestCase):
             with closing(connect(sqlite_path(data_dir))) as conn:
                 counts = embedding_counts(conn)
                 self.assertEqual(counts["embedded"], 3)
-                dims = conn.execute(
-                    "SELECT MIN(dims), MAX(dims) FROM embeddings"
-                ).fetchone()
+                dims = conn.execute("SELECT MIN(dims), MAX(dims) FROM embeddings").fetchone()
                 self.assertEqual(tuple(dims), (3, 3))
 
 
@@ -267,8 +259,7 @@ class FakeEmbeddingHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(size).decode("utf-8"))
         inputs = body.get("inputs", [])
         vectors = [
-            [float(index), float(index + 1), float(len(text))]
-            for index, text in enumerate(inputs)
+            [float(index), float(index + 1), float(len(text))] for index, text in enumerate(inputs)
         ]
         payload = json.dumps(vectors).encode("utf-8")
         self.send_response(200)
@@ -278,6 +269,7 @@ class FakeEmbeddingHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def log_message(self, format: str, *args: object) -> None:
+        _ = (format, args)
         return
 
 

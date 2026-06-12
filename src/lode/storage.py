@@ -124,9 +124,7 @@ def upsert_repo(conn: sqlite3.Connection, root: Path) -> str:
     return repo_id
 
 
-def replace_file_index(
-    conn: sqlite3.Connection, repo_id: str, file_index: FileIndex
-) -> None:
+def replace_file_index(conn: sqlite3.Connection, repo_id: str, file_index: FileIndex) -> None:
     now = time.time()
     with conn:
         old_node_ids = [
@@ -263,9 +261,7 @@ def dedupe_edges(edges: list[Edge]) -> list[Edge]:
     return out
 
 
-def remove_missing_files(
-    conn: sqlite3.Connection, repo_id: str, live_paths: set[str]
-) -> int:
+def remove_missing_files(conn: sqlite3.Connection, repo_id: str, live_paths: set[str]) -> int:
     rows = list(conn.execute("SELECT path FROM files WHERE repo_id = ?", (repo_id,)))
     removed = 0
     with conn:
@@ -293,9 +289,7 @@ def remove_missing_files(
                 "DELETE FROM nodes WHERE repo_id = ? AND owner_path = ?",
                 (repo_id, path),
             )
-            conn.execute(
-                "DELETE FROM files WHERE repo_id = ? AND path = ?", (repo_id, path)
-            )
+            conn.execute("DELETE FROM files WHERE repo_id = ? AND path = ?", (repo_id, path))
             removed += 1
     return removed
 
@@ -440,15 +434,11 @@ def find_symbol(
 
 
 def get_node(conn: sqlite3.Connection, node_id: str) -> dict[str, Any] | None:
-    row = conn.execute(
-        "SELECT *, 0.0 AS rank FROM nodes WHERE id = ?", (node_id,)
-    ).fetchone()
+    row = conn.execute("SELECT *, 0.0 AS rank FROM nodes WHERE id = ?", (node_id,)).fetchone()
     return row_to_node_dict(row) if row else None
 
 
-def get_neighbors(
-    conn: sqlite3.Connection, node_id: str, limit: int = 80
-) -> dict[str, Any]:
+def get_neighbors(conn: sqlite3.Connection, node_id: str, limit: int = 80) -> dict[str, Any]:
     outgoing_rows = conn.execute(
         """
         SELECT e.kind AS edge_kind, e.confidence AS edge_confidence, e.detail, n.*, 0.0 AS rank
@@ -498,9 +488,7 @@ def row_to_node_dict(row: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
-def pending_embedding_nodes(
-    conn: sqlite3.Connection, limit: int = 32
-) -> list[dict[str, Any]]:
+def pending_embedding_nodes(conn: sqlite3.Connection, limit: int = 32) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT n.*, 0.0 AS rank

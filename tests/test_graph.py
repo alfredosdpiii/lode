@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import sqlite3
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -10,7 +8,7 @@ from tempfile import TemporaryDirectory
 from lode.config import sqlite_path
 from lode.graph import blast_radius, impact_report, impact_targets, resolve_graph
 from lode.indexer import index_repo
-from lode.storage import connect, find_symbol, get_node
+from lode.storage import connect, find_symbol
 
 
 def _write_multi_file_repo(repo: Path) -> None:
@@ -39,9 +37,7 @@ def _write_multi_file_repo(repo: Path) -> None:
         encoding="utf-8",
     )
     (repo / "runner.py").write_text(
-        "from app import login\n\n"
-        "def main():\n"
-        "    return login('world')\n",
+        "from app import login\n\ndef main():\n    return login('world')\n",
         encoding="utf-8",
     )
     (repo / "orphan.py").write_text(
@@ -132,9 +128,7 @@ class ResolveGraphTests(unittest.TestCase):
         with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
             repo = Path(repo_tmp)
             data_dir = Path(data_tmp)
-            (repo / "lib.py").write_text(
-                "def exported_func():\n    return 1\n", encoding="utf-8"
-            )
+            (repo / "lib.py").write_text("def exported_func():\n    return 1\n", encoding="utf-8")
             (repo / "consumer.py").write_text(
                 "from lib import *\n\ndef caller():\n    return exported_func()\n",
                 encoding="utf-8",
@@ -154,12 +148,9 @@ class ResolveGraphTests(unittest.TestCase):
         with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
             repo = Path(repo_tmp)
             data_dir = Path(data_tmp)
-            (repo / "lib.ts").write_text(
-                "export function fn() { return 1; }\n", encoding="utf-8"
-            )
+            (repo / "lib.ts").write_text("export function fn() { return 1; }\n", encoding="utf-8")
             (repo / "app.ts").write_text(
-                'import { fn } from "./lib";\n'
-                "export function main() { return fn(); }\n",
+                'import { fn } from "./lib";\nexport function main() { return fn(); }\n',
                 encoding="utf-8",
             )
             stats = index_repo(repo, sqlite_path(data_dir))
@@ -180,15 +171,9 @@ class ResolveGraphTests(unittest.TestCase):
             pkg = repo / "pkg"
             pkg.mkdir()
             (pkg / "__init__.py").write_text("", encoding="utf-8")
-            (repo / "lib.py").write_text(
-                "def fn():\n    return 1\n", encoding="utf-8"
-            )
-            (pkg / "mod.py").write_text(
-                "def inner():\n    return 2\n", encoding="utf-8"
-            )
-            (pkg / "mod2.py").write_text(
-                "def named():\n    return 3\n", encoding="utf-8"
-            )
+            (repo / "lib.py").write_text("def fn():\n    return 1\n", encoding="utf-8")
+            (pkg / "mod.py").write_text("def inner():\n    return 2\n", encoding="utf-8")
+            (pkg / "mod2.py").write_text("def named():\n    return 3\n", encoding="utf-8")
             (repo / "consumer.py").write_text(
                 "import lib\n"
                 "import lib as l\n"
@@ -218,16 +203,10 @@ class ResolveGraphTests(unittest.TestCase):
         with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
             repo = Path(repo_tmp)
             data_dir = Path(data_tmp)
-            (repo / "a.py").write_text(
-                "def render():\n    return 'a'\n", encoding="utf-8"
-            )
-            (repo / "b.py").write_text(
-                "def render():\n    return 'b'\n", encoding="utf-8"
-            )
+            (repo / "a.py").write_text("def render():\n    return 'a'\n", encoding="utf-8")
+            (repo / "b.py").write_text("def render():\n    return 'b'\n", encoding="utf-8")
             (repo / "consumer.py").write_text(
-                "from a import render\n\n"
-                "def caller():\n"
-                "    return render()\n",
+                "from a import render\n\ndef caller():\n    return render()\n",
                 encoding="utf-8",
             )
             stats = index_repo(repo, sqlite_path(data_dir))
@@ -325,13 +304,11 @@ class BlastRadiusTests(unittest.TestCase):
             repo = Path(repo_tmp)
             data_dir = Path(data_tmp)
             _write_multi_file_repo(repo)
-            stats = index_repo(repo, sqlite_path(data_dir))
+            index_repo(repo, sqlite_path(data_dir))
 
             with closing(connect(sqlite_path(data_dir))) as conn:
                 greet = find_symbol(conn, "greet")[0]
-                result = blast_radius(
-                    conn, greet["id"], depth=3, direction="up"
-                )
+                result = blast_radius(conn, greet["id"], depth=3, direction="up")
                 upstream = result.get("upstream", [])
                 qnames = {entry["node"]["qname"] for entry in upstream}
                 self.assertIn("services.auth.authenticate", qnames)
@@ -341,13 +318,11 @@ class BlastRadiusTests(unittest.TestCase):
             repo = Path(repo_tmp)
             data_dir = Path(data_tmp)
             _write_multi_file_repo(repo)
-            stats = index_repo(repo, sqlite_path(data_dir))
+            index_repo(repo, sqlite_path(data_dir))
 
             with closing(connect(sqlite_path(data_dir))) as conn:
                 main_fn = find_symbol(conn, "main")[0]
-                result = blast_radius(
-                    conn, main_fn["id"], depth=3, direction="down"
-                )
+                result = blast_radius(conn, main_fn["id"], depth=3, direction="down")
                 downstream = result.get("downstream", [])
                 qnames = {entry["node"]["qname"] for entry in downstream}
                 self.assertIn("app.login", qnames)
@@ -357,7 +332,7 @@ class BlastRadiusTests(unittest.TestCase):
             repo = Path(repo_tmp)
             data_dir = Path(data_tmp)
             _write_multi_file_repo(repo)
-            stats = index_repo(repo, sqlite_path(data_dir))
+            index_repo(repo, sqlite_path(data_dir))
 
             with closing(connect(sqlite_path(data_dir))) as conn:
                 greet = find_symbol(conn, "greet")[0]
@@ -390,7 +365,7 @@ class BlastRadiusTests(unittest.TestCase):
                 "@app.post('/process')\ndef handle_process(data: str):\n    return process(data)\n",
                 encoding="utf-8",
             )
-            stats = index_repo(repo, sqlite_path(data_dir))
+            index_repo(repo, sqlite_path(data_dir))
 
             with closing(connect(sqlite_path(data_dir))) as conn:
                 process_fn = find_symbol(conn, "process")[0]
@@ -406,7 +381,7 @@ class BlastRadiusTests(unittest.TestCase):
             repo = Path(repo_tmp)
             data_dir = Path(data_tmp)
             _write_multi_file_repo(repo)
-            stats = index_repo(repo, sqlite_path(data_dir))
+            index_repo(repo, sqlite_path(data_dir))
 
             with closing(connect(sqlite_path(data_dir))) as conn:
                 greet = find_symbol(conn, "greet")[0]
@@ -419,13 +394,11 @@ class BlastRadiusTests(unittest.TestCase):
             repo = Path(repo_tmp)
             data_dir = Path(data_tmp)
             _write_multi_file_repo(repo)
-            stats = index_repo(repo, sqlite_path(data_dir))
+            index_repo(repo, sqlite_path(data_dir))
 
             with closing(connect(sqlite_path(data_dir))) as conn:
                 greet = find_symbol(conn, "greet")[0]
-                result = blast_radius(
-                    conn, greet["id"], depth=5, max_nodes=1, direction="up"
-                )
+                result = blast_radius(conn, greet["id"], depth=5, max_nodes=1, direction="up")
                 self.assertTrue(result.get("truncated", False))
 
     def test_blast_radius_on_nonexistent_node(self) -> None:
@@ -452,8 +425,7 @@ class BlastRadiusTests(unittest.TestCase):
                 entries = result.get("upstream", [])
                 self.assertTrue(
                     any(
-                        entry["via"] == "IMPORTS"
-                        and entry["scope"] == "conservative_file"
+                        entry["via"] == "IMPORTS" and entry["scope"] == "conservative_file"
                         for entry in entries
                     ),
                     entries,
@@ -466,13 +438,11 @@ class ImpactReportTests(unittest.TestCase):
             repo = Path(repo_tmp)
             data_dir = Path(data_tmp)
             _write_multi_file_repo(repo)
-            stats = index_repo(repo, sqlite_path(data_dir))
+            index_repo(repo, sqlite_path(data_dir))
 
             with closing(connect(sqlite_path(data_dir))) as conn:
                 greet = find_symbol(conn, "greet")[0]
-                report = impact_report(
-                    conn, greet, depth=3, direction="both"
-                )
+                report = impact_report(conn, greet, depth=3, direction="both")
                 self.assertIn("blast_radius", report)
                 self.assertIn("summary", report)
                 self.assertGreater(report["summary"]["upstream"], 0)
@@ -486,9 +456,7 @@ class ImpactReportTests(unittest.TestCase):
             stats = index_repo(repo, sqlite_path(data_dir))
 
             with closing(connect(sqlite_path(data_dir))) as conn:
-                targets = impact_targets(
-                    conn, "greet", repo_id=stats.repo_id, limit=5
-                )
+                targets = impact_targets(conn, "greet", repo_id=stats.repo_id, limit=5)
                 self.assertTrue(targets)
                 self.assertEqual(targets[0]["name"], "greet")
 
@@ -501,9 +469,7 @@ class ImpactReportTests(unittest.TestCase):
 
             with closing(connect(sqlite_path(data_dir))) as conn:
                 greet = find_symbol(conn, "greet")[0]
-                targets = impact_targets(
-                    conn, greet["id"], repo_id=stats.repo_id, limit=5
-                )
+                targets = impact_targets(conn, greet["id"], repo_id=stats.repo_id, limit=5)
                 self.assertEqual(len(targets), 1)
                 self.assertEqual(targets[0]["id"], greet["id"])
 
@@ -511,13 +477,9 @@ class ImpactReportTests(unittest.TestCase):
         with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
             repo = Path(repo_tmp)
             data_dir = Path(data_tmp)
-            (repo / "lib.py").write_text(
-                "def fn():\n    return 1\n", encoding="utf-8"
-            )
+            (repo / "lib.py").write_text("def fn():\n    return 1\n", encoding="utf-8")
             (repo / "consumer.py").write_text(
-                "from lib import fn\n\n"
-                "def caller():\n"
-                "    return fn()\n",
+                "from lib import fn\n\ndef caller():\n    return fn()\n",
                 encoding="utf-8",
             )
             index_repo(repo, sqlite_path(data_dir))
@@ -525,9 +487,7 @@ class ImpactReportTests(unittest.TestCase):
             with closing(connect(sqlite_path(data_dir))) as conn:
                 caller = find_symbol(conn, "caller")[0]
                 report = impact_report(conn, caller, depth=1, direction="down")
-                callee_kinds = {
-                    item["node"]["kind"] for item in report["callees"] if item["node"]
-                }
+                callee_kinds = {item["node"]["kind"] for item in report["callees"] if item["node"]}
                 self.assertIn("Function", callee_kinds)
                 self.assertNotIn("ExternalSymbol", callee_kinds)
 

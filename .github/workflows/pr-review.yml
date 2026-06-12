@@ -1,0 +1,34 @@
+name: Automated PR review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review-note:
+    name: Review note
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post agent-readiness review note
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const body = [
+              "## Automated readiness review",
+              "",
+              "- Confirm `uv run ruff check .` passes.",
+              "- Confirm `uv run mypy src tests scripts benchmarks` passes.",
+              "- Confirm tests and coverage were run.",
+              "- Confirm no secrets, local data, or generated cache files are included.",
+              "- If graph behavior changed, include impact or blast-radius evidence."
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });

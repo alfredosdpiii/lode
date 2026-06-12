@@ -12,14 +12,13 @@ from typing import Any
 
 from .config import default_data_dir, kuzu_path, sqlite_path
 from .context import build_context_pack
-from .graph import blast_radius, impact_report, impact_targets
+from .graph import impact_report, impact_targets
 from .indexer import index_repo
 from .storage import (
     connect,
     embedding_counts,
     find_symbol,
     get_neighbors,
-    get_node,
     list_repos,
     pending_embedding_nodes,
     repo_filter,
@@ -42,9 +41,7 @@ def main(argv: list[str] | None = None) -> int:
         ValueError,
     ) as exc:
         if getattr(args, "json", False):
-            print(
-                json.dumps({"ok": False, "error": str(exc)}, indent=2), file=sys.stderr
-            )
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2), file=sys.stderr)
         else:
             print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -83,9 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_symbol)
 
-    p = sub.add_parser(
-        "context", help="Build a token-budgeted context pack for an agent task"
-    )
+    p = sub.add_parser("context", help="Build a token-budgeted context pack for an agent task")
     p.add_argument("query")
     p.add_argument("--repo")
     p.add_argument("--budget", type=int, default=6000)
@@ -130,9 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_kuzu_sync)
 
-    p = sub.add_parser(
-        "embed", help="Embed queued nodes with the local embeddings service"
-    )
+    p = sub.add_parser("embed", help="Embed queued nodes with the local embeddings service")
     p.add_argument("--limit", type=int, default=32)
     p.add_argument("--url")
     p.add_argument("--model")
@@ -167,9 +160,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         repo_id = repo_filter(conn, args.repo)
         output = {
             "ok": True,
-            "results": search_nodes(
-                conn, args.query, repo_id=repo_id, limit=args.limit
-            ),
+            "results": search_nodes(conn, args.query, repo_id=repo_id, limit=args.limit),
         }
     emit(output, args.json)
     return 0
@@ -304,23 +295,31 @@ def emit(data: dict[str, Any], as_json: bool) -> None:
             qname = target.get("qname") or target.get("name") or data["query"]
             kind = target.get("kind") or "?"
             print(f"  {kind} {qname}")
-            print(f"    callers={summary.get('callers', 0)}  callees={summary.get('callees', 0)}  "
-                  f"files={summary.get('files', 0)}")
-            print(f"    upstream={summary.get('upstream', 0)}  downstream={summary.get('downstream', 0)}  "
-                  f"entrypoints={summary.get('entrypoints', 0)}  depth={summary.get('depth', '?')}")
+            print(
+                f"    callers={summary.get('callers', 0)}  callees={summary.get('callees', 0)}  "
+                f"files={summary.get('files', 0)}"
+            )
+            print(
+                f"    upstream={summary.get('upstream', 0)}  downstream={summary.get('downstream', 0)}  "
+                f"entrypoints={summary.get('entrypoints', 0)}  depth={summary.get('depth', '?')}"
+            )
             radius = result.get("blast_radius") or {}
             for entry in radius.get("upstream", []):
                 node = entry.get("node") or {}
                 d = entry.get("distance", "?")
                 via = entry.get("via", "?")
                 conf = entry.get("confidence", "?")
-                print(f"    [up d={d} {via} {conf}] {node.get('kind', '?')} {node.get('qname', '?')}")
+                print(
+                    f"    [up d={d} {via} {conf}] {node.get('kind', '?')} {node.get('qname', '?')}"
+                )
             for entry in radius.get("downstream", []):
                 node = entry.get("node") or {}
                 d = entry.get("distance", "?")
                 via = entry.get("via", "?")
                 conf = entry.get("confidence", "?")
-                print(f"    [dn d={d} {via} {conf}] {node.get('kind', '?')} {node.get('qname', '?')}")
+                print(
+                    f"    [dn d={d} {via} {conf}] {node.get('kind', '?')} {node.get('qname', '?')}"
+                )
             for fentry in radius.get("files", []):
                 print(f"    [file d={fentry.get('distance', '?')}] {fentry.get('path', '?')}")
             for ep in radius.get("entrypoints", []):

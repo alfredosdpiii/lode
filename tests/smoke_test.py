@@ -14,9 +14,7 @@ def run_help(command: str) -> None:
         text=True,
     )
     if "Lode" not in result.stdout and "lode" not in result.stdout:
-        raise AssertionError(
-            f"unexpected help output from {command!r}: {result.stdout!r}"
-        )
+        raise AssertionError(f"unexpected help output from {command!r}: {result.stdout!r}")
 
 
 def main() -> None:

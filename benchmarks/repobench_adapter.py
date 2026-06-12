@@ -63,9 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query-lines", type=int, default=12)
     parser.add_argument("--search-limit", type=int, default=20)
     parser.add_argument("--context-budget", type=int, default=4000)
-    parser.add_argument(
-        "--details", action="store_true", help="Include per-sample rows"
-    )
+    parser.add_argument("--details", action="store_true", help="Include per-sample rows")
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--json", action="store_true")
@@ -159,10 +157,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 if "sample_root" in locals() and sample_root.exists():
                     shutil.rmtree(sample_root)
 
-    metrics = {
-        f"hit_at_{k}": round(hits[k] / evaluated, 6) if evaluated else 0.0
-        for k in top_k
-    }
+    metrics = {f"hit_at_{k}": round(hits[k] / evaluated, 6) if evaluated else 0.0 for k in top_k}
     metrics["mrr"] = round(mean(reciprocal_ranks), 6) if reciprocal_ranks else 0.0
     return {
         "ok": True,
@@ -174,9 +169,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "metrics": metrics,
         "timing_ms": {
             "index_mean": round(mean(index_timings), 3) if index_timings else 0.0,
-            "retrieve_mean": round(mean(retrieve_timings), 3)
-            if retrieve_timings
-            else 0.0,
+            "retrieve_mean": round(mean(retrieve_timings), 3) if retrieve_timings else 0.0,
         },
         "details": rows if args.details else [],
         "errors": errors[:20],
@@ -246,9 +239,7 @@ def safe_relative_path(raw: Any, fallback: str) -> Path:
 def unique_path(path: Path, used_paths: set[str], index: int) -> Path:
     candidate = path
     while candidate.as_posix() in used_paths:
-        candidate = candidate.with_name(
-            f"{candidate.stem}__ctx{index}{candidate.suffix}"
-        )
+        candidate = candidate.with_name(f"{candidate.stem}__ctx{index}{candidate.suffix}")
     used_paths.add(candidate.as_posix())
     return candidate
 
@@ -277,13 +268,9 @@ def retrieve_paths(
 ) -> list[str]:
     paths: list[str] = []
     if mode in {"search", "hybrid"}:
-        paths.extend(
-            row["path"] for row in search_nodes(conn, query, limit=search_limit)
-        )
+        paths.extend(row["path"] for row in search_nodes(conn, query, limit=search_limit))
     if mode in {"context", "hybrid"}:
-        pack = build_context_pack(
-            conn, query, budget=context_budget, limit=min(search_limit, 20)
-        )
+        pack = build_context_pack(conn, query, budget=context_budget, limit=min(search_limit, 20))
         paths.extend(item["path"] for item in pack.get("top_hits") or [])
         paths.extend(item["path"] for item in pack.get("must_read") or [])
     return unique_preserve_order(paths)
@@ -317,10 +304,7 @@ def print_summary(result: dict[str, Any]) -> None:
     print("RepoBench-style Lode retrieval benchmark")
     print(f"input: {result['input']}")
     print(f"mode: {result['mode']}")
-    print(
-        f"samples: evaluated={result['samples_evaluated']} "
-        f"skipped={result['samples_skipped']}"
-    )
+    print(f"samples: evaluated={result['samples_evaluated']} skipped={result['samples_skipped']}")
     for name, value in result["metrics"].items():
         print(f"{name}: {value:.6f}")
     print(

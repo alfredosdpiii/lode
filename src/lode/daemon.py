@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import uuid
 from contextlib import closing
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,9 +13,11 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import default_data_dir, sqlite_path
 from .context import build_context_pack
-from .graph import blast_radius, impact_report, impact_targets
+from .features import enabled
+from .graph import impact_report, impact_targets
 from .indexer import index_repo
-from .storage import connect, get_node, list_repos, repo_filter, search_nodes
+from .observability import Metrics, log_event
+from .storage import connect, list_repos, repo_filter, search_nodes
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,9 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def serve(
-    host: str = "127.0.0.1", port: int = 7979, data_dir: Path | None = None
-) -> None:
+def serve(host: str = "127.0.0.1", port: int = 7979, data_dir: Path | None = None) -> None:
     root = data_dir or default_data_dir()
 
     class Handler(LodeHandler):
@@ -42,11 +43,16 @@ def serve(
 
 class LodeHandler(BaseHTTPRequestHandler):
     daemon_data_dir: Path = default_data_dir()
+    daemon_metrics: Metrics = Metrics()
 
     def do_GET(self) -> None:
+        self.ensure_request_id()
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self.send_json({"ok": True, "service": "lode"})
+            return
+        if parsed.path == "/metrics" and enabled("metrics"):
+            self.send_text(self.daemon_metrics.render(), content_type="text/plain")
             return
         if parsed.path == "/status":
             with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
@@ -62,9 +68,7 @@ class LodeHandler(BaseHTTPRequestHandler):
                 self.send_json(
                     {
                         "ok": True,
-                        "results": search_nodes(
-                            conn, query, repo_id=repo_id, limit=limit
-                        ),
+                        "results": search_nodes(conn, query, repo_id=repo_id, limit=limit),
                     }
                 )
             return
@@ -102,6 +106,7 @@ class LodeHandler(BaseHTTPRequestHandler):
         self.send_json({"ok": False, "error": "not found"}, status=404)
 
     def do_POST(self) -> None:
+        self.ensure_request_id()
         try:
             body = self.read_json()
             if self.path == "/index":
@@ -118,9 +123,7 @@ class LodeHandler(BaseHTTPRequestHandler):
                     self.send_json(
                         {
                             "ok": True,
-                            "results": search_nodes(
-                                conn, query, repo_id=repo_id, limit=limit
-                            ),
+                            "results": search_nodes(conn, query, repo_id=repo_id, limit=limit),
                         }
                     )
                 return
@@ -145,8 +148,8 @@ class LodeHandler(BaseHTTPRequestHandler):
                 limit = int(body.get("limit") or 5)
                 neighbor_limit = int(body.get("neighbor_limit") or 200)
                 depth_value = body.get("depth")
-                depth = int(depth_value) if depth_value not in (None, "") else None
-                max_nodes = int(body.get("max_nodes") or 1000)
+                depth = int(str(depth_value)) if depth_value not in (None, "") else None
+                max_nodes = int(str(body.get("max_nodes") or 1000))
                 direction = body.get("direction") or "both"
                 with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
                     repo_id = repo_filter(conn, repo)
@@ -188,15 +191,47 @@ class LodeHandler(BaseHTTPRequestHandler):
             raise TypeError("request body must be a JSON object")
         return data
 
+    def ensure_request_id(self) -> str:
+        request_id = getattr(self, "request_id", None)
+        if request_id:
+            return request_id
+        header = self.headers.get("x-request-id") if self.headers else None
+        self.request_id = header or uuid.uuid4().hex
+        return self.request_id
+
     def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         data = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))
+        self.send_header("x-request-id", self.ensure_request_id())
         self.end_headers()
         self.wfile.write(data)
+        self.record_request(status)
+
+    def send_text(self, payload: str, status: int = 200, content_type: str = "text/plain") -> None:
+        data = payload.encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", content_type)
+        self.send_header("content-length", str(len(data)))
+        self.send_header("x-request-id", self.ensure_request_id())
+        self.end_headers()
+        self.wfile.write(data)
+        self.record_request(status)
+
+    def record_request(self, status: int) -> None:
+        path = urlparse(self.path).path
+        self.daemon_metrics.record(self.command, path, status)
+        log_event(
+            "http_request",
+            request_id=self.ensure_request_id(),
+            method=self.command,
+            path=path,
+            status=status,
+        )
 
     def log_message(self, format: str, *args: Any) -> None:
+        _ = (format, args)
         return
 
 

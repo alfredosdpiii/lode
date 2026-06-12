@@ -39,4 +39,3 @@ class FileIndex:
     generated: bool
     nodes: list[Node]
     edges: list[Edge]
-

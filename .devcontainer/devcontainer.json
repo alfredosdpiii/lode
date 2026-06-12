@@ -1,0 +1,17 @@
+{
+  "name": "lode",
+  "image": "mcr.microsoft.com/devcontainers/python:3.13",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "charliermarsh.ruff",
+        "ms-python.mypy-type-checker",
+        "ms-python.python"
+      ]
+    }
+  },
+  "postCreateCommand": "pipx install uv && uv sync --extra kuzu --dev"
+}

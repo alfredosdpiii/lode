@@ -8,9 +8,7 @@ from typing import Any
 from .config import kuzu_path
 
 
-def sync_from_sqlite(
-    conn: sqlite3.Connection, path: Path | None = None
-) -> dict[str, Any]:
+def sync_from_sqlite(conn: sqlite3.Connection, path: Path | None = None) -> dict[str, Any]:
     try:
         import kuzu  # type: ignore[import-not-found]
     except ImportError as exc:

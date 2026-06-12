@@ -57,9 +57,7 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
     """Rebuild all confidence='resolved' edges for a repo from parse facts."""
     file_languages = {
         row["path"]: row["language"]
-        for row in conn.execute(
-            "SELECT path, language FROM files WHERE repo_id = ?", (repo_id,)
-        )
+        for row in conn.execute("SELECT path, language FROM files WHERE repo_id = ?", (repo_id,))
     }
     file_paths = set(file_languages)
     file_nodes: dict[str, str] = {}
@@ -98,9 +96,7 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
         defs_by_file.setdefault(row["path"], {}).setdefault(row["name"], []).append(row)
         if row["kind"] == "Method" and "." in row["qname"]:
             class_qname = row["qname"].rsplit(".", 1)[0]
-            methods_by_class.setdefault(
-                (row["path"], class_qname, row["name"]), []
-            ).append(row)
+            methods_by_class.setdefault((row["path"], class_qname, row["name"]), []).append(row)
 
     module_cache: dict[tuple[str, str], str | None] = {}
 
@@ -116,9 +112,7 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
                 module_cache[key] = None
         return module_cache[key]
 
-    def pick_def(
-        path: str | None, name: str | None, prefer: tuple[str, ...]
-    ) -> sqlite3.Row | None:
+    def pick_def(path: str | None, name: str | None, prefer: tuple[str, ...]) -> sqlite3.Row | None:
         if not path or not name:
             return None
         rows = defs_by_file.get(path, {}).get(name, [])
@@ -168,15 +162,14 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
                 row: sqlite3.Row | None = None
                 if name in (None, ""):
                     if remainder:
-                        row = pick_def(
-                            resolve_module(module, caller_path), remainder[0], prefer
-                        )
+                        row = pick_def(resolve_module(module, caller_path), remainder[0], prefer)
                 elif name == "default":
                     symbol = remainder[0] if remainder else prefix
                     row = pick_def(resolve_module(module, caller_path), symbol, prefer)
                 else:
+                    import_name = name or ""
                     if remainder:
-                        submodule = join_module_name(module, name)
+                        submodule = join_module_name(module, import_name)
                         row = pick_def(
                             resolve_module(submodule, caller_path),
                             remainder[0],
@@ -189,7 +182,7 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
                                 prefer,
                             )
                     else:
-                        row = pick_def(resolve_module(module, caller_path), name, prefer)
+                        row = pick_def(resolve_module(module, caller_path), import_name, prefer)
                 if row is not None:
                     found[row["id"]] = row
             if len(found) == 1:
@@ -198,13 +191,13 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
                 return None
 
         if len(segments) == 1 and star_modules:
-            found: dict[str, sqlite3.Row] = {}
+            star_found: dict[str, sqlite3.Row] = {}
             for module in star_modules:
                 row = pick_def(resolve_module(module, caller_path), segments[0], prefer)
                 if row is not None:
-                    found[row["id"]] = row
-            if len(found) == 1:
-                return next(iter(found.values()))
+                    star_found[row["id"]] = row
+            if len(star_found) == 1:
+                return next(iter(star_found.values()))
         return None
 
     def resolve_self_or_class_method(
@@ -218,9 +211,7 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
         if caller["caller_kind"] != "Method" or "." not in caller["caller_qname"]:
             return None
         class_qname = caller["caller_qname"].rsplit(".", 1)[0]
-        rows = methods_by_class.get(
-            (caller["caller_path"], class_qname, segments[1]), []
-        )
+        rows = methods_by_class.get((caller["caller_path"], class_qname, segments[1]), [])
         pool = [row for row in rows if row["kind"] in prefer] or rows
         return pool[0] if len(pool) == 1 else None
 
@@ -315,9 +306,7 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
         )
         for edge in unresolved_calls:
             call_name = (edge["detail"] or edge["target_name"] or "").strip()
-            row = resolve_target(
-                edge["owner_path"], call_name, CALLABLE_KINDS, caller=edge
-            )
+            row = resolve_target(edge["owner_path"], call_name, CALLABLE_KINDS, caller=edge)
             if row is None or row["id"] == edge["src"]:
                 continue
             result = conn.execute(
@@ -368,9 +357,7 @@ def join_module_name(module: str, name: str) -> str:
     return f"{module}.{name}"
 
 
-def resolve_python_module(
-    module: str, importer: str, file_paths: set[str]
-) -> str | None:
+def resolve_python_module(module: str, importer: str, file_paths: set[str]) -> str | None:
     module = module.strip()
     if not module:
         return None
@@ -384,6 +371,7 @@ def resolve_python_module(
         base = parts[: len(parts) - ups] if ups else parts
         segments = [segment for segment in rest.split(".") if segment]
         rel = "/".join([*base, *segments])
+        candidates: tuple[str, ...]
         if rel:
             candidates = (f"{rel}.py", f"{rel}/__init__.py")
         else:
@@ -417,9 +405,7 @@ def resolve_js_module(module: str, importer: str, file_paths: set[str]) -> str |
     if ext in {".js", ".mjs", ".cjs"}:
         candidates.extend([stem + ".ts", stem + ".tsx"])
     candidates.extend(target + suffix for suffix in JS_SOURCE_SUFFIXES)
-    candidates.extend(
-        posixpath.join(target, f"index{suffix}") for suffix in JS_SOURCE_SUFFIXES
-    )
+    candidates.extend(posixpath.join(target, f"index{suffix}") for suffix in JS_SOURCE_SUFFIXES)
     for candidate in candidates:
         if candidate in file_paths:
             return candidate
@@ -427,9 +413,7 @@ def resolve_js_module(module: str, importer: str, file_paths: set[str]) -> str |
 
 
 def weakest_confidence(left: str | None, right: str | None) -> str:
-    rank = max(
-        CONFIDENCE_RANK.get(left or "", 3), CONFIDENCE_RANK.get(right or "", 3)
-    )
+    rank = max(CONFIDENCE_RANK.get(left or "", 3), CONFIDENCE_RANK.get(right or "", 3))
     return RANK_CONFIDENCE[rank]
 
 
@@ -518,9 +502,7 @@ def blast_radius(
     ]
     entrypoints = [entry for entry in upstream if entry["node"]["kind"] == "Route"]
     conservative_file_expansions = sum(
-        1
-        for entry in [*upstream, *downstream]
-        if entry.get("scope") == "conservative_file"
+        1 for entry in [*upstream, *downstream] if entry.get("scope") == "conservative_file"
     )
 
     return {
@@ -577,8 +559,7 @@ def filter_shadowed_external_call_neighbors(
         _call_detail(item["edge"].get("detail"))
         for item in items
         if item.get("edge", {}).get("kind") == "CALLS"
-        and (item.get("node") or {}).get("kind")
-        not in {"ExternalSymbol", "ExternalDependency"}
+        and (item.get("node") or {}).get("kind") not in {"ExternalSymbol", "ExternalDependency"}
         and _call_detail(item["edge"].get("detail"))
     }
     if not resolved_details:
