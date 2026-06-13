@@ -8,8 +8,10 @@ facts into embedded Kuzu when you want graph traversal. The job is simple: answe
 might break if I touch it?" without sending the repo to a hosted code-search
 service.
 
-Watch the generated overview video in the Factory wiki:
-https://app.factory.ai/wiki/a71cbea2-853d-40f7-a479-f1e8d6af8252
+[![Watch the Lode overview video](docs/assets/lode-overview-poster.png)](https://app.factory.ai/wiki/a71cbea2-853d-40f7-a479-f1e8d6af8252)
+
+Watch the generated overview video in the
+[Factory wiki](https://app.factory.ai/wiki/a71cbea2-853d-40f7-a479-f1e8d6af8252).
 
 The generated docs are also mirrored to the GitHub wiki:
 https://github.com/alfredosdpiii/lode/wiki
