@@ -12,6 +12,7 @@ def build_context_pack(
     repo_path: str | None = None,
     budget: int = 6000,
     limit: int = 10,
+    include_related: bool = True,
 ) -> dict[str, Any]:
     repo_id = repo_filter(conn, repo_path)
     hits = sorted(search_nodes(conn, query, repo_id=repo_id, limit=limit), key=context_rank)
@@ -34,17 +35,18 @@ def build_context_pack(
         remaining -= cost
 
     related = []
-    related_neighbors = compact_neighbors_for_hits(conn, hits[:5], limit=16)
-    for hit in hits[:5]:
-        neighbors = related_neighbors.get(hit["id"], {"incoming": [], "outgoing": []})
-        related.append(
-            {
-                "node_id": hit["id"],
-                "qname": hit["qname"],
-                "incoming": neighbors["incoming"],
-                "outgoing": neighbors["outgoing"],
-            }
-        )
+    if include_related:
+        related_neighbors = compact_neighbors_for_hits(conn, hits[:5], limit=16)
+        for hit in hits[:5]:
+            neighbors = related_neighbors.get(hit["id"], {"incoming": [], "outgoing": []})
+            related.append(
+                {
+                    "node_id": hit["id"],
+                    "qname": hit["qname"],
+                    "incoming": neighbors["incoming"],
+                    "outgoing": neighbors["outgoing"],
+                }
+            )
 
     return {
         "query": query,

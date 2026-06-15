@@ -71,6 +71,18 @@ def load_benchmark_script() -> Any:
     return module
 
 
+def load_repobench_adapter_script() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "lode_repobench_adapter", PROJECT_ROOT / "benchmarks" / "repobench_adapter.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load RepoBench adapter script")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class BenchmarkFakeEmbeddingHandler(BaseHTTPRequestHandler):
     requests: list[list[str]] = []
 
@@ -541,6 +553,176 @@ class BenchmarkScriptTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["samples_evaluated"], 1)
         self.assertGreaterEqual(payload["metrics"]["hit_at_3"], 1.0)
+
+    def test_repobench_query_prioritizes_cursor_and_import_terms(self) -> None:
+        adapter = load_repobench_adapter_script()
+        sample = {
+            "file_path": "app.py",
+            "cropped_code": "\n".join(
+                [
+                    "from services import ImportedService",
+                    "def handler():",
+                    "    alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu",
+                    "    nu xi omicron pi rho sigma tau upsilon phi chi psi omega",
+                    "    return target_symbol(value)",
+                ]
+            ),
+        }
+
+        query = adapter.query_from_sample(sample, 3)
+        first_terms = query.split()[:12]
+
+        self.assertIn("target_symbol", first_terms)
+        self.assertIn("ImportedService", query)
+
+    def test_repobench_adapter_boosts_import_linked_target(self) -> None:
+        with tempfile.TemporaryDirectory() as data_tmp:
+            input_path = Path(data_tmp) / "repobench.jsonl"
+            sample = {
+                "idx": "synthetic-import",
+                "repo_name": "synthetic",
+                "file_path": "app.py",
+                "cropped_code": "\n".join(
+                    [
+                        "from services import UserService",
+                        "def create_user(name):",
+                        "    payload = {'name': name}",
+                        "    result = build_payload(payload)",
+                        "    return result",
+                    ]
+                ),
+                "context": [
+                    {
+                        "identifier": "build_payload",
+                        "path": "helpers.py",
+                        "snippet": "def build_payload(payload):\n    return dict(payload)",
+                    },
+                    {
+                        "identifier": "UserService",
+                        "path": "services.py",
+                        "snippet": SERVICE_CODE.rstrip("\n"),
+                    },
+                    {
+                        "identifier": "ResultFormatter",
+                        "path": "formatters.py",
+                        "snippet": "class ResultFormatter:\n    pass",
+                    },
+                ],
+                "gold_snippet_index": 1,
+                "next_line": "    return UserService().save_user(name)",
+            }
+            input_path.write_text(json.dumps(sample) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "benchmarks/repobench_adapter.py",
+                    "--input",
+                    str(input_path),
+                    "--mode",
+                    "context",
+                    "--top-k",
+                    "1",
+                    "3",
+                    "--query-lines",
+                    "1",
+                    "--search-limit",
+                    "30",
+                    "--context-budget",
+                    "6000",
+                    "--details",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["metrics"]["hit_at_1"], 1.0)
+        self.assertEqual(payload["details"][0]["rank"], 1)
+        self.assertEqual(payload["details"][0]["ranked_paths"][0], "services.py")
+
+    def test_repobench_adapter_ranks_duplicate_path_hard_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as data_tmp:
+            input_path = Path(data_tmp) / "repobench.jsonl"
+            contexts = [
+                {
+                    "identifier": "SharedBase",
+                    "path": "pkg/shared.py",
+                    "snippet": "class SharedBase:\n    pass",
+                }
+            ]
+            contexts.extend(
+                {
+                    "identifier": f"NoiseService{index}",
+                    "path": f"pkg/noise_{index}.py",
+                    "snippet": f"class NoiseService{index}:\n    def normalize(self, value):\n        return value",
+                }
+                for index in range(9)
+            )
+            contexts.append(
+                {
+                    "identifier": "TargetService",
+                    "path": "pkg/shared.py",
+                    "snippet": (
+                        "class TargetService:\n"
+                        "    def normalize(self, value):\n"
+                        "        return value.strip().lower()\n"
+                    ),
+                }
+            )
+            sample = {
+                "idx": "synthetic-duplicate-hard",
+                "repo_name": "synthetic",
+                "file_path": "app.py",
+                "cropped_code": "\n".join(
+                    [
+                        "def handler(value):",
+                        "    alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu",
+                        "    nu xi omicron pi rho sigma tau upsilon phi chi psi omega",
+                        "    return TargetService().normalize(value)",
+                    ]
+                ),
+                "context": contexts,
+                "gold_snippet_index": 10,
+                "next_line": "    return TargetService().normalize(value)",
+            }
+            input_path.write_text(json.dumps(sample) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "benchmarks/repobench_adapter.py",
+                    "--input",
+                    str(input_path),
+                    "--mode",
+                    "context",
+                    "--top-k",
+                    "1",
+                    "3",
+                    "5",
+                    "10",
+                    "--query-lines",
+                    "3",
+                    "--search-limit",
+                    "30",
+                    "--context-budget",
+                    "6000",
+                    "--details",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["metrics"]["hit_at_1"], 1.0)
+        self.assertEqual(payload["details"][0]["target_path"], "pkg/shared__ctx10.py")
+        self.assertEqual(payload["details"][0]["ranked_paths"][0], "pkg/shared__ctx10.py")
 
     def test_repobench_adapter_full_diagnostics_schema(self) -> None:
         with tempfile.TemporaryDirectory() as data_tmp:

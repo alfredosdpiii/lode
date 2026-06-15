@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import keyword
 import re
 import shutil
 import sqlite3
@@ -19,6 +20,30 @@ from lode.config import sqlite_path
 from lode.context import build_context_pack
 from lode.indexer import index_repo
 from lode.storage import connect, search_nodes
+
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+_STOPWORDS = set(keyword.kwlist) | {
+    "self",
+    "cls",
+    "none",
+    "true",
+    "false",
+    "return",
+    "def",
+    "class",
+    "import",
+    "from",
+    "as",
+    "with",
+    "for",
+    "while",
+    "try",
+    "except",
+    "finally",
+    "super",
+    "__init__",
+}
 
 
 @dataclass
@@ -38,6 +63,25 @@ class _Accumulator:
 
 def _make_acc(top_k: list[int]) -> _Accumulator:
     return _Accumulator(hits={k: 0 for k in top_k})
+
+
+@dataclass(slots=True)
+class _MaterializedCandidate:
+    path: str
+    identifier: str
+    snippet: str
+    identifier_terms: frozenset[str]
+    path_terms: frozenset[str]
+    snippet_terms: frozenset[str]
+    order: int
+
+
+@dataclass(slots=True)
+class _MaterializedSample:
+    target_path: str
+    current_path: str
+    cropped_code: str
+    candidates: list[_MaterializedCandidate]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -163,7 +207,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 data_dir = sample_root / "data"
                 repo_dir.mkdir(parents=True)
                 data_dir.mkdir(parents=True)
-                target_path = materialize_sample(sample, repo_dir)
+                materialized = materialize_sample(sample, repo_dir)
+                target_path = materialized.target_path
                 query = query_from_sample(sample, args.query_lines)
                 _, index_ms = timed(
                     lambda repo_dir=repo_dir, data_dir=data_dir: index_repo(
@@ -178,6 +223,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             args.mode,
                             args.search_limit,
                             args.context_budget,
+                            materialized,
                         )
                     )
                 rank = first_rank(ranked_paths, target_path)
@@ -442,7 +488,7 @@ def iter_samples(path: Path) -> Iterator[tuple[Path, int, dict[str, Any]]]:
                 yield file_path, line_no, data
 
 
-def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> str:
+def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> _MaterializedSample:
     contexts = sample.get("context")
     if not isinstance(contexts, list) or not contexts:
         raise ValueError("sample has no context list")
@@ -452,6 +498,7 @@ def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> str:
 
     used_paths: set[str] = set()
     target_path = ""
+    candidates: list[_MaterializedCandidate] = []
     for index, context in enumerate(contexts):
         if not isinstance(context, dict):
             raise TypeError("context entry is not an object")
@@ -462,6 +509,19 @@ def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> str:
         )
         snippet = str(context.get("snippet") or context.get("content") or "")
         write_file(repo_dir / rel, snippet)
+        candidates.append(
+            _MaterializedCandidate(
+                path=rel.as_posix(),
+                identifier=str(context.get("identifier") or ""),
+                snippet=snippet,
+                identifier_terms=frozenset(
+                    _identifier_tokens(str(context.get("identifier") or ""))
+                ),
+                path_terms=frozenset(_path_terms(rel.as_posix())),
+                snippet_terms=frozenset(_identifier_tokens(snippet[:4096])),
+                order=index,
+            )
+        )
         if index == gold_index:
             target_path = rel.as_posix()
 
@@ -474,7 +534,12 @@ def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> str:
     write_file(repo_dir / current_path, cropped_code)
     if not target_path:
         raise ValueError("missing gold target path")
-    return target_path
+    return _MaterializedSample(
+        target_path=target_path,
+        current_path=current_path.as_posix(),
+        cropped_code=cropped_code,
+        candidates=candidates,
+    )
 
 
 def safe_relative_path(raw: Any, fallback: str) -> Path:
@@ -506,9 +571,13 @@ def query_from_sample(sample: dict[str, Any], query_lines: int) -> str:
     lines = [line.rstrip() for line in cropped_code.splitlines() if line.strip()]
     if not lines:
         return str(sample.get("file_path") or sample.get("repo_name") or "")
-    raw_query = "\n".join(lines[-max(1, query_lines) :])
-    identifiers = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", raw_query)
-    return " ".join(identifiers[-64:]) if identifiers else raw_query
+    selected = lines[-max(1, query_lines) :]
+    identifiers: list[str] = []
+    for line in reversed(selected):
+        identifiers.extend(_identifier_tokens(line, preserve_case=True))
+    identifiers.extend(_import_query_terms(cropped_code, preserve_case=True))
+    identifiers = _dedupe_preserve_order(identifiers)
+    return " ".join(identifiers[:96]) if identifiers else "\n".join(selected)
 
 
 def retrieve_paths(
@@ -517,15 +586,142 @@ def retrieve_paths(
     mode: str,
     search_limit: int,
     context_budget: int,
+    materialized: _MaterializedSample | None = None,
 ) -> list[str]:
     paths: list[str] = []
     if mode in {"search", "hybrid"}:
         paths.extend(row["path"] for row in search_nodes(conn, query, limit=search_limit))
     if mode in {"context", "hybrid"}:
-        pack = build_context_pack(conn, query, budget=context_budget, limit=min(search_limit, 20))
+        pack = build_context_pack(
+            conn,
+            query,
+            budget=context_budget,
+            limit=min(search_limit, 20),
+            include_related=False,
+        )
         paths.extend(item["path"] for item in pack.get("top_hits") or [])
         paths.extend(item["path"] for item in pack.get("must_read") or [])
-    return unique_preserve_order(paths)
+    paths = unique_preserve_order(paths)
+    if materialized is not None:
+        return rerank_materialized_candidates(query, materialized, paths, search_limit)
+    return paths
+
+
+def rerank_materialized_candidates(
+    query: str,
+    materialized: _MaterializedSample,
+    lode_paths: list[str],
+    limit: int,
+) -> list[str]:
+    query_terms = _weighted_query_terms(query)
+    import_terms = set(_import_query_terms(materialized.cropped_code))
+    lode_rank = {path: index for index, path in enumerate(lode_paths)}
+    ranked: list[tuple[float, int, int, str]] = []
+    for candidate in materialized.candidates:
+        score = _candidate_score(candidate, query_terms, import_terms)
+        if candidate.path in lode_rank:
+            score += max(0.0, 12.0 - float(lode_rank[candidate.path])) * 0.75
+        if score <= 0.0:
+            continue
+        ranked.append(
+            (
+                -score,
+                lode_rank.get(candidate.path, len(lode_paths) + candidate.order),
+                candidate.order,
+                candidate.path,
+            )
+        )
+    candidate_paths = [path for *_unused, path in sorted(ranked)]
+    return unique_preserve_order([*candidate_paths, *lode_paths])[:limit]
+
+
+def _candidate_score(
+    candidate: _MaterializedCandidate,
+    query_terms: dict[str, float],
+    import_terms: set[str],
+) -> float:
+    if not query_terms and not import_terms:
+        return 0.0
+    identifier_terms = candidate.identifier_terms
+    path_terms = candidate.path_terms
+    snippet_terms = candidate.snippet_terms
+    query_set = set(query_terms)
+
+    score = 0.0
+    score += 8.0 * len(query_set & identifier_terms)
+    score += 6.0 * len(query_set & path_terms)
+    score += 1.0 * len(query_set & snippet_terms)
+    score += 12.0 * len(import_terms & path_terms)
+    score += 10.0 * len(import_terms & identifier_terms)
+    score += 0.75 * len(import_terms & snippet_terms)
+
+    for term, weight in query_terms.items():
+        if term in identifier_terms:
+            score += 4.0 * weight
+        if term in path_terms:
+            score += 3.0 * weight
+        if term in snippet_terms:
+            score += 0.35 * weight
+    return score
+
+
+def _weighted_query_terms(query: str) -> dict[str, float]:
+    terms = _identifier_tokens(query)
+    weights: dict[str, float] = {}
+    for index, term in enumerate(terms[:32]):
+        weights[term] = max(weights.get(term, 0.0), 1.0 - min(index, 31) / 40.0)
+    return weights
+
+
+def _import_query_terms(code: str, preserve_case: bool = False) -> list[str]:
+    terms: list[str] = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(("import ", "from ")):
+            continue
+        terms.extend(_identifier_tokens(stripped, preserve_case=preserve_case))
+        terms.extend(_path_terms(stripped, preserve_case=preserve_case))
+    return [term for term in _dedupe_preserve_order(terms) if term.lower() not in _STOPWORDS]
+
+
+def _identifier_tokens(value: str, preserve_case: bool = False) -> list[str]:
+    tokens: list[str] = []
+    for raw in _IDENTIFIER_RE.findall(value):
+        tokens.extend(_split_identifier(raw, preserve_case=preserve_case))
+    return [token for token in tokens if token.lower() not in _STOPWORDS]
+
+
+def _path_terms(value: str, preserve_case: bool = False) -> list[str]:
+    tokens: list[str] = []
+    for raw in _PATH_TOKEN_RE.findall(value.replace("\\", "/")):
+        tokens.extend(_split_identifier(raw, preserve_case=preserve_case))
+    return [token for token in tokens if token.lower() not in _STOPWORDS]
+
+
+def _split_identifier(value: str, preserve_case: bool = False) -> list[str]:
+    parts = [
+        part
+        for chunk in re.split(r"[_\W]+", value)
+        for part in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+", chunk)
+    ]
+    if not parts and value:
+        parts = [value]
+    tokens = [part if preserve_case else part.lower() for part in parts if len(part) > 1]
+    if len(value) > 1:
+        tokens.append(value if preserve_case else value.lower())
+    return _dedupe_preserve_order(tokens)
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for value in values:
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
 
 
 def unique_preserve_order(values: list[str]) -> list[str]:
