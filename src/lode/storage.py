@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -244,7 +245,10 @@ def replace_file_indexes_rows(
                     json.dumps(node.extra, sort_keys=True),
                 )
             )
-            fts_values.append((node.id, node.qname, node.name, node.signature, node.doc, node.path))
+            if node.kind not in {"ExternalSymbol", "ExternalDependency"}:
+                fts_values.append(
+                    (node.id, node.qname, node.name, node.signature, node.doc, node.path)
+                )
             if (
                 node.kind in {"Function", "Method", "Class", "Route", "DocSection"}
                 and node.content_hash
@@ -264,25 +268,30 @@ def replace_file_indexes_rows(
             for edge in deduped_edges
         )
     if node_values:
-        conn.executemany(
+        execute_values(
+            conn,
             """
             INSERT INTO nodes(
                 id, repo_id, owner_path, kind, name, qname, path, start_line, end_line,
                 signature, doc, confidence, content_hash, extra_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            )
             """,
             node_values,
         )
     if fts_values:
-        conn.executemany(
-            "INSERT INTO node_fts(node_id, qname, name, signature, doc, path) VALUES (?, ?, ?, ?, ?, ?)",
+        execute_values(
+            conn,
+            "INSERT INTO node_fts(node_id, qname, name, signature, doc, path)",
             fts_values,
         )
     if queue_values:
-        conn.executemany(
+        execute_values(
+            conn,
             """
             INSERT INTO embedding_queue(node_id, repo_id, content_hash, queued_at)
-            VALUES (?, ?, ?, ?)
+            """,
+            queue_values,
+            """
             ON CONFLICT(node_id) DO UPDATE SET
               content_hash=excluded.content_hash,
               queued_at=CASE
@@ -294,13 +303,12 @@ def replace_file_indexes_rows(
                 ELSE embedding_queue.embedded_at
               END
             """,
-            queue_values,
         )
     if edge_values:
-        conn.executemany(
+        execute_values(
+            conn,
             """
             INSERT OR IGNORE INTO edges(repo_id, owner_path, src, dst, kind, confidence, detail)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             edge_values,
         )
@@ -331,6 +339,30 @@ def dedupe_edges(edges: list[Edge]) -> list[Edge]:
 
 def chunked(items: list[str], size: int) -> list[list[str]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def chunked_rows(rows: list[tuple[Any, ...]], size: int) -> list[list[tuple[Any, ...]]]:
+    return [rows[index : index + size] for index in range(0, len(rows), size)]
+
+
+def execute_values(
+    conn: sqlite3.Connection,
+    insert_sql: str,
+    rows: list[tuple[Any, ...]],
+    suffix_sql: str = "",
+) -> None:
+    if not rows:
+        return
+    width = len(rows[0])
+    row_placeholder = "(" + ", ".join("?" for _ in range(width)) + ")"
+    max_rows = max(1, min(400, 12_000 // max(1, width)))
+    for row_group in chunked_rows(rows, max_rows):
+        placeholders = ", ".join(row_placeholder for _ in row_group)
+        params = [value for row in row_group for value in row]
+        conn.execute(
+            f"{insert_sql} VALUES {placeholders} {suffix_sql}",  # nosec B608
+            params,
+        )
 
 
 def delete_embedding_artifacts(conn: sqlite3.Connection, node_ids: list[str]) -> None:
@@ -431,13 +463,61 @@ def path_fts_query(query: str) -> str:
 
 
 def column_fts_query(query: str) -> str:
-    import re
-
     tokens = re.findall(r"[A-Za-z0-9_./:-]+", query)
     if not tokens:
         return ""
     columns = ("name", "qname", "path")
     return " OR ".join(f"{column}: {token}" for token in tokens[:12] for column in columns)
+
+
+def external_like_terms(query: str) -> list[str]:
+    return [token.lower() for token in re.findall(r"[A-Za-z0-9_./:-]+", query)[:12]]
+
+
+def external_node_like_rows(
+    conn: sqlite3.Connection,
+    query: str,
+    repo_id: str | None,
+    limit: int,
+) -> Any:
+    terms = external_like_terms(query)
+    if not terms:
+        return []
+    clauses = []
+    params: list[Any] = []
+    for term in terms:
+        clauses.append("(lower(n.name) LIKE ? OR lower(n.qname) LIKE ? OR lower(n.path) LIKE ?)")
+        like = f"%{term}%"
+        params.extend([like, like, like])
+    filter_sql = " OR ".join(clauses)
+    if repo_id:
+        return conn.execute(
+            f"""
+            SELECT n.*, 0.0 AS rank
+            FROM nodes n
+            WHERE n.repo_id = ?
+              AND n.kind IN ('ExternalSymbol', 'ExternalDependency')
+              AND ({filter_sql})
+            ORDER BY
+              CASE WHEN lower(n.name) = ? THEN 0 ELSE 1 END,
+              length(n.qname), n.path, n.start_line
+            LIMIT ?
+            """,  # nosec B608
+            [repo_id, *params, query.lower(), limit],
+        )
+    return conn.execute(
+        f"""
+        SELECT n.*, 0.0 AS rank
+        FROM nodes n
+        WHERE n.kind IN ('ExternalSymbol', 'ExternalDependency')
+          AND ({filter_sql})
+        ORDER BY
+          CASE WHEN lower(n.name) = ? THEN 0 ELSE 1 END,
+          length(n.qname), n.path, n.start_line
+        LIMIT ?
+        """,  # nosec B608
+        [*params, query.lower(), limit],
+    )
 
 
 def append_unique_nodes(
@@ -714,39 +794,10 @@ def search_nodes(
         results = stable_search_results(candidates, limit)
 
         seen_ids = {str(node["id"]) for node in results}
-        try:
-            if len(results) < limit and broad_fts:
-                fill_limit = limit - len(results)
-                if repo_id:
-                    external_rows = conn.execute(
-                        """
-                        SELECT n.*, bm25(node_fts) AS rank
-                        FROM node_fts
-                        JOIN nodes n ON n.id = node_fts.node_id
-                        WHERE node_fts MATCH ?
-                          AND n.repo_id = ?
-                          AND n.kind IN ('ExternalSymbol', 'ExternalDependency')
-                        ORDER BY rank, n.path, n.start_line
-                        LIMIT ?
-                        """,
-                        (broad_fts, repo_id, fill_limit),
-                    )
-                else:
-                    external_rows = conn.execute(
-                        """
-                        SELECT n.*, bm25(node_fts) AS rank
-                        FROM node_fts
-                        JOIN nodes n ON n.id = node_fts.node_id
-                        WHERE node_fts MATCH ?
-                          AND n.kind IN ('ExternalSymbol', 'ExternalDependency')
-                        ORDER BY rank, n.path, n.start_line
-                        LIMIT ?
-                        """,
-                        (broad_fts, fill_limit),
-                    )
-                append_unique_nodes(external_rows, results, seen_ids, limit)
-        except sqlite3.OperationalError:
-            pass
+        if len(results) < limit and broad_fts:
+            fill_limit = limit - len(results)
+            external_rows = external_node_like_rows(conn, query, repo_id, fill_limit)
+            append_unique_nodes(external_rows, results, seen_ids, limit)
 
         if results:
             return results

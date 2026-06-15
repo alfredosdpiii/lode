@@ -154,7 +154,12 @@ class LodeIndexTests(unittest.TestCase):
                         (repo_id, "app.py"),
                     )
                 )
-                self.assertEqual(len(fts_rows), len(file_index.nodes))
+                expected_fts_ids = {
+                    n.id
+                    for n in file_index.nodes
+                    if n.kind not in {"ExternalSymbol", "ExternalDependency"}
+                }
+                self.assertEqual(len(fts_rows), len(expected_fts_ids))
 
                 # Verify embedding queue has expected rows
                 queue_rows = list(
@@ -251,6 +256,132 @@ class LodeIndexTests(unittest.TestCase):
                 self.assertTrue(substring)
                 self.assertTrue(
                     any(item["qname"] == "context_tools.Build_Context_Pack" for item in substring)
+                )
+
+    def test_python_parser_preserves_nested_call_attribution(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "app.py").write_text(
+                "\n".join(
+                    [
+                        "def helper():",
+                        "    return 1",
+                        "",
+                        "def outer():",
+                        "    def inner():",
+                        "        return helper()",
+                        "    return inner()",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                outer = find_symbol(conn, "outer")[0]
+                helper = find_symbol(conn, "helper")[0]
+                edge = conn.execute(
+                    """
+                    SELECT confidence, detail FROM edges
+                    WHERE src = ? AND dst = ? AND kind = 'CALLS'
+                    """,
+                    (outer["id"], helper["id"]),
+                ).fetchone()
+                self.assertIsNotNone(edge)
+                self.assertEqual(edge["confidence"], "strong")
+                self.assertEqual(edge["detail"], "helper")
+
+    def test_function_local_imports_still_resolve_calls(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "callee.py").write_text(
+                "def target():\n    return 'ok'\n",
+                encoding="utf-8",
+            )
+            (repo / "caller.py").write_text(
+                "\n".join(
+                    [
+                        "def caller():",
+                        "    from callee import target",
+                        "    return target()",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            stats = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreaterEqual(stats.resolved_calls, 1)
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                target = find_symbol(conn, "target")[0]
+                neighbors = get_neighbors(conn, target["id"])
+                self.assert_has_resolved_caller(neighbors, "caller.caller")
+
+    def test_repeated_external_calls_are_persisted_once_per_owner(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "app.py").write_text(
+                "\n".join(
+                    [
+                        "def noisy():",
+                        "    print('one')",
+                        "    print('two')",
+                        "    print('three')",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            stats = index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                external_print_nodes = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM nodes
+                    WHERE repo_id = ? AND owner_path = ? AND kind = 'ExternalSymbol' AND name = ?
+                    """,
+                    (stats.repo_id, "app.py", "print"),
+                ).fetchone()[0]
+                print_edges = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM edges
+                    WHERE repo_id = ? AND owner_path = ? AND kind = 'CALLS' AND detail = ?
+                    """,
+                    (stats.repo_id, "app.py", "print"),
+                ).fetchone()[0]
+                self.assertEqual(external_print_nodes, 1)
+                self.assertEqual(print_edges, 1)
+                external_fts_rows = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM node_fts f
+                    JOIN nodes n ON n.id = f.node_id
+                    WHERE n.repo_id = ? AND n.kind = 'ExternalSymbol' AND n.name = ?
+                    """,
+                    (stats.repo_id, "print"),
+                ).fetchone()[0]
+                self.assertEqual(external_fts_rows, 0)
+                external_results = search_nodes(conn, "print", limit=5)
+                self.assertTrue(
+                    any(
+                        row["kind"] == "ExternalSymbol" and row["name"] == "print"
+                        for row in external_results
+                    )
                 )
 
     def test_context_related_matches_public_neighbor_compaction(self) -> None:

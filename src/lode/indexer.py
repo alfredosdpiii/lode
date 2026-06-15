@@ -6,6 +6,7 @@ import os
 import re
 import time
 from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,10 @@ EXCLUDED_DIRS = {
     "droid-wiki",
 }
 
+PARALLEL_PARSE_THRESHOLD = 8
+MAX_PARSE_WORKERS = 8
+ParseJob = tuple[str, str, str, float, int, str]
+
 
 @dataclass(slots=True)
 class IndexStats:
@@ -96,7 +101,7 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
         repo_id = upsert_repo(conn, root)
         stats = IndexStats(repo_id=repo_id, root=str(root))
         live_paths: set[str] = set()
-        changed_files: list[FileIndex] = []
+        parse_jobs: list[ParseJob] = []
         skipped_updates: list[tuple[float, float, str, str]] = []
         previous_files = {
             row["path"]: {
@@ -128,11 +133,17 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
                 skipped_updates.append((stat.st_mtime, time.time(), repo_id, rel))
                 continue
             text = raw.decode("utf-8", errors="replace")
-            file_index = parse_file(root, path, digest, stat.st_mtime, stat.st_size, text)
-            changed_files.append(file_index)
-            stats.indexed += 1
-            stats.nodes += len(file_index.nodes)
-            stats.edges += len(file_index.edges)
+            parse_jobs.append((str(root), str(path), digest, stat.st_mtime, stat.st_size, text))
+        if should_parse_in_parallel(parse_jobs):
+            conn.commit()
+            conn.close()
+            changed_files = parse_file_jobs(parse_jobs)
+            conn = connect(db_path)
+        else:
+            changed_files = parse_file_jobs(parse_jobs)
+        stats.indexed = len(changed_files)
+        stats.nodes = sum(len(file_index.nodes) for file_index in changed_files)
+        stats.edges = sum(len(file_index.edges) for file_index in changed_files)
         with conn:
             if skipped_updates:
                 conn.executemany(
@@ -149,6 +160,25 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
         return stats
     finally:
         conn.close()
+
+
+def should_parse_in_parallel(parse_jobs: list[ParseJob]) -> bool:
+    return len(parse_jobs) >= PARALLEL_PARSE_THRESHOLD and (os.cpu_count() or 1) > 1
+
+
+def parse_file_jobs(parse_jobs: list[ParseJob]) -> list[FileIndex]:
+    if not parse_jobs:
+        return []
+    if not should_parse_in_parallel(parse_jobs):
+        return [_parse_file_job(job) for job in parse_jobs]
+    worker_count = min(MAX_PARSE_WORKERS, len(parse_jobs), os.cpu_count() or 1)
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(_parse_file_job, parse_jobs, chunksize=1))
+
+
+def _parse_file_job(job: ParseJob) -> FileIndex:
+    root, path, digest, mtime, size, text = job
+    return parse_file(Path(root), Path(path), digest, mtime, size, text)
 
 
 def iter_source_files(root: Path):
@@ -299,6 +329,16 @@ def parse_python(
     nodes: list[Node] = []
     edges: list[Edge] = []
     import_bindings: list[dict[str, Any]] = []
+    external_cache: dict[tuple[str, str], Node] = {}
+
+    def cached_external_node(kind: str, name: str) -> Node:
+        key = (kind, name)
+        node = external_cache.get(key)
+        if node is None:
+            node = external_node(kind, name, rel)
+            external_cache[key] = node
+        return node
+
     module = module_qname(rel)
     try:
         tree = ast.parse(text)
@@ -335,7 +375,7 @@ def parse_python(
             for base in item.bases:
                 base_name = dotted_name(base)
                 if base_name:
-                    base_node = external_node("ExternalSymbol", base_name, rel)
+                    base_node = cached_external_node("ExternalSymbol", base_name)
                     nodes.append(base_node)
                     edges.append(
                         Edge(
@@ -368,7 +408,7 @@ def parse_python(
                 import_bindings.append(
                     {"module": import_module, "name": None, "alias": alias.asname}
                 )
-                dep = external_node("ExternalDependency", import_module, rel)
+                dep = cached_external_node("ExternalDependency", import_module)
                 nodes.append(dep)
                 edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", import_module))
         elif isinstance(import_node, ast.ImportFrom):
@@ -385,7 +425,7 @@ def parse_python(
                 else:
                     import_bindings.append({"module": module, "name": alias.name, "alias": None})
             if module:
-                dep = external_node("ExternalDependency", module, rel)
+                dep = cached_external_node("ExternalDependency", module)
                 nodes.append(dep)
                 edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", module))
         elif isinstance(import_node, ast.Call):
@@ -403,7 +443,7 @@ def parse_python(
         if target_id:
             edges.append(Edge(caller_id, target_id, "CALLS", "strong", call_name))
         else:
-            target = external_node("ExternalSymbol", call_name, rel)
+            target = cached_external_node("ExternalSymbol", call_name)
             nodes.append(target)
             edges.append(Edge(caller_id, target.id, "CALLS", "heuristic", call_name))
     return nodes, edges, import_bindings

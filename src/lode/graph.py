@@ -201,6 +201,8 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
         pool = [row for row in rows if row["kind"] in prefer] or rows
         return pool[0] if len(pool) == 1 else None
 
+    resolve_target_cache: dict[tuple[str, str, tuple[str, ...], str], sqlite3.Row | None] = {}
+
     def resolve_target(
         caller_path: str,
         dotted: str,
@@ -210,28 +212,32 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
         dotted = (dotted or "").strip()
         if not dotted:
             return None
-        exact = by_qname.get(dotted)
-        if exact is not None:
-            return exact
-        row = resolve_self_or_class_method(caller, dotted, prefer)
-        if row is not None:
-            return row
-        if dotted.split(".")[0] in {"self", "cls", "this"}:
-            return None
-        row = resolve_via_imports(caller_path, dotted, prefer)
-        if row is not None:
-            return row
-        if "." in dotted:
+        first_segment = dotted.split(".", 1)[0]
+        caller_context = ""
+        if caller is not None and first_segment in {"self", "cls", "this"}:
+            caller_context = str(caller["caller_qname"] or "")
+        cache_key = (caller_path, dotted, prefer, caller_context)
+        if cache_key in resolve_target_cache:
+            return resolve_target_cache[cache_key]
+
+        row = by_qname.get(dotted)
+        if row is None:
+            row = resolve_self_or_class_method(caller, dotted, prefer)
+        if row is None and first_segment not in {"self", "cls", "this"}:
+            row = resolve_via_imports(caller_path, dotted, prefer)
+        if row is None and first_segment not in {"self", "cls", "this"} and "." in dotted:
             suffix = "." + dotted
             matches = suffix_matches.get(suffix, [])
             if len(matches) == 1:
-                return matches[0]
-        simple = dotted.rsplit(".", 1)[-1]
-        matches = by_name.get(simple, [])
-        pool = [r for r in matches if r["kind"] in prefer] or matches
-        if len(pool) == 1:
-            return pool[0]
-        return None
+                row = matches[0]
+        if row is None and first_segment not in {"self", "cls", "this"}:
+            simple = dotted.rsplit(".", 1)[-1]
+            matches = by_name.get(simple, [])
+            pool = [r for r in matches if r["kind"] in prefer] or matches
+            if len(pool) == 1:
+                row = pool[0]
+        resolve_target_cache[cache_key] = row
+        return row
 
     counts = {"imports": 0, "calls": 0, "extends": 0}
     with conn:
