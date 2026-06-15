@@ -12,10 +12,46 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 BENCH_COMPARE = [sys.executable, "scripts/bench_compare.py"]
 
+OPERATIONAL_PARAMETERS = {
+    "repo": "/home/bryan/Projects/lode",
+    "repeat": 10,
+    "limit": 20,
+    "budget": 4000,
+    "queries": ["build context pack", "embedding queue"],
+    "symbols": ["build_context_pack"],
+    "include_kuzu": True,
+    "embed_url": None,
+    "embed_limit": 32,
+}
+
+EMBEDDING_PARAMETERS = {
+    "repo": "/home/bryan/Projects/lode",
+    "repeat": 10,
+    "limit": 20,
+    "budget": 4000,
+    "queries": ["build context pack", "embedding queue"],
+    "symbols": ["build_context_pack"],
+    "embed_url": "http://127.0.0.1:7980",
+    "embed_limit": 32,
+    "model": "Snowflake/snowflake-arctic-embed-s",
+}
+
+REPOBENCH_PARAMETERS = {
+    "input": "/home/bryan/.cache/lode/benchmarks/repobench_python_v1.1/jsonl",
+    "mode": "context",
+    "top_k": [1, 3, 5, 10],
+    "query_lines": 5,
+    "search_limit": 30,
+    "context_budget": 6000,
+    "limit": None,
+    "start": 0,
+}
+
 
 class BenchCompareOperationalTests(unittest.TestCase):
     def test_comparator_passes_better_metrics(self) -> None:
         current = load_baseline()
+        current["parameters"] = OPERATIONAL_PARAMETERS
         # Improve every latency metric so it beats baseline
         current["cold_index"]["timing_ms"] = 100.0
         current["hot_index"]["timing_ms"] = 5.0
@@ -35,7 +71,6 @@ class BenchCompareOperationalTests(unittest.TestCase):
                 summary["p95"] = 0.15
                 summary["max"] = 0.2
         current["kuzu"]["timing_ms"] = 1000.0
-        current["embeddings"]["vectors_per_second"] = 50.0
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
             json.dump(current, fh)
@@ -71,6 +106,8 @@ class BenchCompareOperationalTests(unittest.TestCase):
                 payload["environment"]["LODE_EMBEDDINGS_MODEL"],
                 "Snowflake/snowflake-arctic-embed-s",
             )
+            self.assertIn("approved_parameters", payload)
+            self.assertIn("current_parameters", payload)
             for path, metric in payload["metrics"].items():
                 self.assertIn("baseline", metric)
                 self.assertIn("current", metric)
@@ -79,11 +116,16 @@ class BenchCompareOperationalTests(unittest.TestCase):
                 self.assertIn("pass", metric)
             self.assertNotIn("missing_metrics", payload)
             self.assertNotIn("failed_metrics", payload)
+            self.assertNotIn("parameter_diagnostics", payload)
+            # Operational must not require embeddings metrics
+            self.assertNotIn("embeddings.vectors_per_second", payload["metrics"])
+            self.assertNotIn("embeddings.dims", payload["metrics"])
         finally:
             current_path.unlink(missing_ok=True)
 
     def test_comparator_fails_worsened_metric(self) -> None:
         current = load_baseline()
+        current["parameters"] = OPERATIONAL_PARAMETERS
         # Make one latency metric worse than baseline
         current["cold_index"]["timing_ms"] = 500.0
 
@@ -112,6 +154,7 @@ class BenchCompareOperationalTests(unittest.TestCase):
 
     def test_comparator_fails_missing_metric(self) -> None:
         current = load_baseline()
+        current["parameters"] = OPERATIONAL_PARAMETERS
         del current["hot_index"]["timing_ms"]
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
@@ -135,32 +178,9 @@ class BenchCompareOperationalTests(unittest.TestCase):
         finally:
             current_path.unlink(missing_ok=True)
 
-    def test_comparator_fails_invariant_violation(self) -> None:
-        current = load_baseline()
-        current["embeddings"]["dims"] = 512
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
-            json.dump(current, fh)
-            current_path = Path(fh.name)
-
-        try:
-            result = subprocess.run(
-                [*BENCH_COMPARE, "--type", "operational", "--current", str(current_path)],
-                capture_output=True,
-                text=True,
-                cwd=PROJECT_ROOT,
-            )
-            payload = json.loads(result.stdout)
-            self.assertTrue(payload["ok"])
-            self.assertFalse(payload["overall_pass"])
-            self.assertIn("failed_metrics", payload)
-            self.assertIn("embeddings.dims", payload["failed_metrics"])
-            self.assertEqual(payload["metrics"]["embeddings.dims"]["direction"], "invariant")
-        finally:
-            current_path.unlink(missing_ok=True)
-
     def test_comparator_fails_coverage_floor_violation(self) -> None:
         current = load_baseline()
+        current["parameters"] = OPERATIONAL_PARAMETERS
         current["database"]["counts"]["nodes"] = 100
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
@@ -187,6 +207,7 @@ class BenchCompareOperationalTests(unittest.TestCase):
 
     def test_comparator_reports_timing_issues(self) -> None:
         current = load_baseline()
+        current["parameters"] = OPERATIONAL_PARAMETERS
         # Corrupt timing summary order
         current["search"]["build context pack"]["timing_ms"]["p50"] = 10.0
         current["search"]["build context pack"]["timing_ms"]["min"] = 20.0
@@ -213,6 +234,7 @@ class BenchCompareOperationalTests(unittest.TestCase):
 
     def test_comparator_fails_nonnumeric_metric(self) -> None:
         current = load_baseline()
+        current["parameters"] = OPERATIONAL_PARAMETERS
         current["neighbors"]["timing_ms"]["p50"] = "fast"
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
@@ -239,10 +261,10 @@ class BenchCompareOperationalTests(unittest.TestCase):
 
     def test_comparator_output_file(self) -> None:
         current = load_baseline()
+        current["parameters"] = OPERATIONAL_PARAMETERS
         current["cold_index"]["timing_ms"] = 100.0
         current["hot_index"]["timing_ms"] = 5.0
         current["kuzu"]["timing_ms"] = 1000.0
-        current["embeddings"]["vectors_per_second"] = 50.0
         # Fix timing summaries to remain valid
         for path in [
             "search.build context pack.timing_ms",
@@ -288,10 +310,248 @@ class BenchCompareOperationalTests(unittest.TestCase):
             current_path.unlink(missing_ok=True)
             output_path.unlink(missing_ok=True)
 
+    def test_operational_ignores_bad_embedding_metrics(self) -> None:
+        current = load_baseline()
+        current["parameters"] = OPERATIONAL_PARAMETERS
+        # Make embedding metrics terrible: operational should still ignore them
+        current["embeddings"]["vectors_per_second"] = 0.1
+        current["embeddings"]["dims"] = 512
+        current["embeddings"]["embedded"] = 1
+        current["embeddings"]["model"] = "wrong-model"
+        # Improve operational metrics so they pass independently
+        current["cold_index"]["timing_ms"] = 100.0
+        current["hot_index"]["timing_ms"] = 5.0
+        current["kuzu"]["timing_ms"] = 1000.0
+        for path in [
+            "search.build context pack.timing_ms",
+            "search.embedding queue.timing_ms",
+            "symbols.build_context_pack.timing_ms",
+            "context.build context pack.timing_ms",
+            "context.embedding queue.timing_ms",
+            "neighbors.timing_ms",
+        ]:
+            summary = get_nested(current, path)
+            if summary:
+                summary["p50"] = 0.1
+                summary["min"] = 0.05
+                summary["p95"] = 0.15
+                summary["max"] = 0.2
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "operational", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            # Should pass because operational does not require embeddings
+            self.assertTrue(payload["overall_pass"], msg=json.dumps(payload, indent=2))
+            self.assertNotIn("embeddings.vectors_per_second", payload["metrics"])
+            self.assertNotIn("embeddings.dims", payload["metrics"])
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_operational_reports_parameter_mismatch(self) -> None:
+        current = load_baseline()
+        current["parameters"] = {**OPERATIONAL_PARAMETERS, "repeat": 5}
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "operational", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("parameter_diagnostics", payload)
+            diagnostics = payload["parameter_diagnostics"]
+            repeat_diag = [d for d in diagnostics if d["parameter"] == "repeat"]
+            self.assertEqual(len(repeat_diag), 1)
+            self.assertEqual(repeat_diag[0]["expected"], 10)
+            self.assertEqual(repeat_diag[0]["actual"], 5)
+        finally:
+            current_path.unlink(missing_ok=True)
+
+
+class BenchCompareEmbeddingTests(unittest.TestCase):
+    def test_embedding_comparator_passes_better_metrics(self) -> None:
+        current = load_baseline()
+        current["parameters"] = EMBEDDING_PARAMETERS
+        current["embeddings"]["vectors_per_second"] = 50.0
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "embedding", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["overall_pass"], msg=json.dumps(payload, indent=2))
+            self.assertEqual(payload["type"], "embedding")
+            self.assertIn("baseline_source", payload)
+            self.assertIn("metrics", payload)
+            self.assertIn("embeddings.vectors_per_second", payload["metrics"])
+            self.assertIn("embeddings.dims", payload["metrics"])
+            self.assertIn("approved_parameters", payload)
+            self.assertIn("current_parameters", payload)
+            self.assertNotIn("parameter_diagnostics", payload)
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_embedding_comparator_fails_worsened_throughput(self) -> None:
+        current = load_baseline()
+        current["parameters"] = EMBEDDING_PARAMETERS
+        current["embeddings"]["vectors_per_second"] = 1.0
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "embedding", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("failed_metrics", payload)
+            self.assertIn("embeddings.vectors_per_second", payload["failed_metrics"])
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_embedding_comparator_fails_invariant_violation(self) -> None:
+        current = load_baseline()
+        current["parameters"] = EMBEDDING_PARAMETERS
+        current["embeddings"]["dims"] = 512
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "embedding", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("failed_metrics", payload)
+            self.assertIn("embeddings.dims", payload["failed_metrics"])
+            self.assertEqual(payload["metrics"]["embeddings.dims"]["direction"], "invariant")
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_embedding_comparator_fails_model_mismatch(self) -> None:
+        current = load_baseline()
+        current["parameters"] = {**EMBEDDING_PARAMETERS, "model": "wrong-model"}
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "embedding", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("parameter_diagnostics", payload)
+            model_diag = [d for d in payload["parameter_diagnostics"] if d["parameter"] == "model"]
+            self.assertEqual(len(model_diag), 1)
+            self.assertEqual(model_diag[0]["expected"], "Snowflake/snowflake-arctic-embed-s")
+            self.assertEqual(model_diag[0]["actual"], "wrong-model")
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_embedding_comparator_fails_database_reconciliation(self) -> None:
+        current = load_baseline()
+        current["parameters"] = EMBEDDING_PARAMETERS
+        # Break the reconciliation: make after != before + embedded
+        current["database_after_embeddings"]["counts"]["embeddings"] = 9999
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "embedding", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("reconciliation_issues", payload)
+            self.assertTrue(len(payload["reconciliation_issues"]) > 0)
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_embedding_comparator_fails_embed_limit_mismatch(self) -> None:
+        current = load_baseline()
+        current["parameters"] = {**EMBEDDING_PARAMETERS, "embed_limit": 64}
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "embedding", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("parameter_diagnostics", payload)
+            limit_diag = [
+                d for d in payload["parameter_diagnostics"] if d["parameter"] == "embed_limit"
+            ]
+            self.assertEqual(len(limit_diag), 1)
+            self.assertEqual(limit_diag[0]["expected"], 32)
+            self.assertEqual(limit_diag[0]["actual"], 64)
+        finally:
+            current_path.unlink(missing_ok=True)
+
 
 class BenchCompareRepoBenchTests(unittest.TestCase):
     def test_repobench_comparator_passes_better_metrics(self) -> None:
         current = load_repobench_baseline()
+        # Inject parameters so validation passes
+        current["input"] = "/home/bryan/.cache/lode/benchmarks/repobench_python_v1.1/jsonl"
+        current["start"] = 0
+        current["limit"] = None
         # Improve all quality metrics and lower latency
         for key in ["hit_at_1", "hit_at_3", "hit_at_5", "hit_at_10", "mrr"]:
             current["metrics"][key] = 0.99
@@ -319,11 +579,17 @@ class BenchCompareRepoBenchTests(unittest.TestCase):
             self.assertIn("baseline_source", payload)
             self.assertIn("metrics", payload)
             self.assertIn("split_results", payload)
+            self.assertIn("approved_parameters", payload)
+            self.assertIn("current_parameters", payload)
+            self.assertNotIn("parameter_diagnostics", payload)
+            self.assertNotIn("invariant_issues", payload)
         finally:
             current_path.unlink(missing_ok=True)
 
     def test_repobench_comparator_fails_worsened_metric(self) -> None:
         current = load_repobench_baseline()
+        current["start"] = 0
+        current["limit"] = None
         current["metrics"]["hit_at_1"] = 0.0
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
@@ -350,6 +616,8 @@ class BenchCompareRepoBenchTests(unittest.TestCase):
 
     def test_repobench_comparator_fails_missing_mrr(self) -> None:
         current = load_repobench_baseline()
+        current["start"] = 0
+        current["limit"] = None
         del current["metrics"]["mrr"]
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
@@ -373,6 +641,8 @@ class BenchCompareRepoBenchTests(unittest.TestCase):
 
     def test_repobench_comparator_fails_invariant_sample_count(self) -> None:
         current = load_repobench_baseline()
+        current["start"] = 0
+        current["limit"] = None
         current["samples_evaluated"] = 15000
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
@@ -396,6 +666,8 @@ class BenchCompareRepoBenchTests(unittest.TestCase):
 
     def test_repobench_comparator_fails_missing_split(self) -> None:
         current = load_repobench_baseline()
+        current["start"] = 0
+        current["limit"] = None
         del current["split_results"]["cross_file_first"]
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
@@ -414,6 +686,90 @@ class BenchCompareRepoBenchTests(unittest.TestCase):
             self.assertFalse(payload["overall_pass"])
             self.assertIn("missing_metrics", payload)
             self.assertIn("split_results.cross_file_first", payload["missing_metrics"])
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_repobench_comparator_fails_combined_evaluated_skipped_invariant(self) -> None:
+        current = load_repobench_baseline()
+        current["start"] = 0
+        current["limit"] = None
+        # Break the invariant: evaluated + skipped != baseline total
+        current["samples_evaluated"] = 15600
+        current["samples_skipped"] = 10
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "repobench", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("invariant_issues", payload)
+            issues = [i for i in payload["invariant_issues"] if "combined evaluated + skipped" in i]
+            self.assertEqual(len(issues), 1)
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_repobench_comparator_fails_split_evaluated_skipped_invariant(self) -> None:
+        current = load_repobench_baseline()
+        current["start"] = 0
+        current["limit"] = None
+        # Break split invariant for cross_file_first
+        current["split_results"]["cross_file_first"]["samples_evaluated"] = 8000
+        current["split_results"]["cross_file_first"]["samples_skipped"] = 5
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "repobench", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("invariant_issues", payload)
+            issues = [i for i in payload["invariant_issues"] if "cross_file_first" in i]
+            self.assertEqual(len(issues), 1)
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_repobench_comparator_fails_parameter_mismatch(self) -> None:
+        current = load_repobench_baseline()
+        current["start"] = 0
+        current["limit"] = None
+        current["mode"] = "search"
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "repobench", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("parameter_diagnostics", payload)
+            mode_diag = [d for d in payload["parameter_diagnostics"] if d["parameter"] == "mode"]
+            self.assertEqual(len(mode_diag), 1)
+            self.assertEqual(mode_diag[0]["expected"], "context")
+            self.assertEqual(mode_diag[0]["actual"], "search")
         finally:
             current_path.unlink(missing_ok=True)
 

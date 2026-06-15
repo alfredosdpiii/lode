@@ -276,6 +276,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "query_lines": args.query_lines,
         "search_limit": args.search_limit,
         "context_budget": args.context_budget,
+        "start": args.start,
+        "limit": args.limit,
         "metrics": combined_metrics,
         "hit_counts": {f"hit_at_{k}": all_hits[k] for k in top_k},
         "reciprocal_rank_sum": round(sum(all_rrs), 6) if all_rrs else 0.0,

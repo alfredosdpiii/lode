@@ -19,6 +19,7 @@ from typing import Any, TypeVar
 from lode.cli import embedding_text
 from lode.config import kuzu_path, sqlite_path
 from lode.context import build_context_pack
+from lode.embeddings import embeddings_model
 from lode.indexer import index_repo
 from lode.storage import (
     connect,
@@ -152,7 +153,21 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     conn, queries, repeat, args.budget, min(args.limit, 10)
                 ),
                 "neighbors": benchmark_neighbors(conn, neighbor_node_id, repeat),
+                "parameters": {
+                    "repo": str(repo),
+                    "repeat": repeat,
+                    "limit": args.limit,
+                    "budget": args.budget,
+                    "queries": queries,
+                    "symbols": symbols,
+                    "include_kuzu": args.include_kuzu,
+                    "embed_url": args.embed_url,
+                    "embed_limit": args.embed_limit,
+                },
             }
+
+            if args.embed_url:
+                result["parameters"]["model"] = embeddings_model()
 
             if args.include_kuzu:
                 result["kuzu"] = benchmark_kuzu(conn, data_dir)
