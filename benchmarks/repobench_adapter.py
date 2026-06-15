@@ -129,7 +129,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             split_name = source.stem
             split_acc = split_accs[split_name]
             if args.limit is not None and global_evaluated >= args.limit:
-                continue
+                break
             sample_id = f"{source.name}:{line_no}"
 
             # Pre-classify bucket and level before materialization so skips

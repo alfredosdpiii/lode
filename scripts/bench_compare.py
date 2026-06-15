@@ -551,7 +551,41 @@ def compare_repobench(
                     f"split {split} evaluated + skipped mismatch: expected {expected_split_total}, got {actual_split_total}"
                 )
                 overall_pass = False
+            if current_split_eval != baseline_split_eval:
+                failed.append(f"split_results.{split}.samples_evaluated")
+                overall_pass = False
+                if split not in split_results:
+                    split_results[split] = {}
+                split_results[split]["samples_evaluated"] = {
+                    "baseline": baseline_split_eval,
+                    "current": current_split_eval,
+                    "direction": "invariant",
+                    "delta": None,
+                    "pass": False,  # nosec B105
+                }
+            if current_split_skip != baseline_split_skip:
+                failed.append(f"split_results.{split}.samples_skipped")
+                overall_pass = False
+                if split not in split_results:
+                    split_results[split] = {}
+                split_results[split]["samples_skipped"] = {
+                    "baseline": baseline_split_skip,
+                    "current": current_split_skip,
+                    "direction": "invariant",
+                    "delta": None,
+                    "pass": False,  # nosec B105
+                }
+        else:
+            if current_split_eval is None:
+                missing.append(f"split_results.{split}.samples_evaluated")
+                overall_pass = False
+            if current_split_skip is None:
+                missing.append(f"split_results.{split}.samples_skipped")
+                overall_pass = False
 
+        # Merge any invariant diagnostics into split_metrics before recording
+        if split in split_results:
+            split_metrics.update(split_results[split])
         split_results[split] = split_metrics
 
     current_params = extract_parameters(current, "repobench")

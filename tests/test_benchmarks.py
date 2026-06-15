@@ -793,6 +793,82 @@ class BenchmarkScriptTests(unittest.TestCase):
         self.assertEqual(payload["samples_evaluated"], 1)
         self.assertEqual(len(payload["details"]), 1)
 
+    def test_repobench_adapter_stops_parsing_after_limit(self) -> None:
+        """When --limit is reached, the adapter stops iterating remaining rows."""
+        with tempfile.TemporaryDirectory() as data_tmp:
+            root = Path(data_tmp)
+            first = root / "cross_file_first.jsonl"
+            random = root / "cross_file_random.jsonl"
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "dataset": "tianyang/repobench_python_v1.1",
+                        "jsonl_files": [str(first), str(random)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sample = {
+                "idx": 0,
+                "repo_name": "synthetic",
+                "file_path": "app.py",
+                "cropped_code": APP_CODE.rstrip("\n"),
+                "context": [
+                    {
+                        "identifier": "UserService",
+                        "path": "services.py",
+                        "snippet": SERVICE_CODE.rstrip("\n"),
+                    },
+                    {
+                        "identifier": "unrelated",
+                        "path": "other.py",
+                        "snippet": "def unrelated():\n    return None",
+                    },
+                ],
+                "gold_snippet_index": 0,
+                "next_line": "    return service.save_user(name)",
+                "level": "2k",
+            }
+            # First file has 2 valid samples
+            first.write_text(
+                json.dumps(sample) + "\n" + json.dumps(sample) + "\n", encoding="utf-8"
+            )
+            # Second file starts with invalid JSON that would cause a parse error if read
+            random.write_text("this is not valid json\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "benchmarks/repobench_adapter.py",
+                    "--input",
+                    str(root),
+                    "--mode",
+                    "context",
+                    "--top-k",
+                    "1",
+                    "3",
+                    "5",
+                    "10",
+                    "--query-lines",
+                    "5",
+                    "--search-limit",
+                    "30",
+                    "--context-budget",
+                    "6000",
+                    "--limit",
+                    "1",
+                    "--json",
+                ],
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        # Must succeed because the adapter stops after limit=1 and never reads the second file
+        self.assertTrue(payload["ok"], msg=result.stdout + result.stderr)
+        self.assertEqual(payload["samples_evaluated"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

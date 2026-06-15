@@ -745,6 +745,51 @@ class BenchCompareRepoBenchTests(unittest.TestCase):
         finally:
             current_path.unlink(missing_ok=True)
 
+    def test_repobench_comparator_fails_split_swapped_evaluated_skipped(self) -> None:
+        """Swap evaluated and skipped while keeping total constant; exact counts must fail."""
+        current = load_repobench_baseline()
+        current["start"] = 0
+        current["limit"] = None
+        # Swap evaluated and skipped for cross_file_first: total stays 8033
+        current["split_results"]["cross_file_first"]["samples_evaluated"] = 7
+        current["split_results"]["cross_file_first"]["samples_skipped"] = 8026
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "repobench", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            # Should fail with split and field diagnostics
+            self.assertIn("failed_metrics", payload)
+            self.assertIn(
+                "split_results.cross_file_first.samples_evaluated", payload["failed_metrics"]
+            )
+            self.assertIn(
+                "split_results.cross_file_first.samples_skipped", payload["failed_metrics"]
+            )
+            # Verify split_results contains the diagnostic details
+            self.assertIn("split_results", payload)
+            split_diag = payload["split_results"]["cross_file_first"]
+            self.assertIn("samples_evaluated", split_diag)
+            self.assertEqual(split_diag["samples_evaluated"]["pass"], False)
+            self.assertEqual(split_diag["samples_evaluated"]["baseline"], 8026)
+            self.assertEqual(split_diag["samples_evaluated"]["current"], 7)
+            self.assertIn("samples_skipped", split_diag)
+            self.assertEqual(split_diag["samples_skipped"]["pass"], False)
+            self.assertEqual(split_diag["samples_skipped"]["baseline"], 7)
+            self.assertEqual(split_diag["samples_skipped"]["current"], 8026)
+        finally:
+            current_path.unlink(missing_ok=True)
+
     def test_repobench_comparator_fails_parameter_mismatch(self) -> None:
         current = load_repobench_baseline()
         current["start"] = 0
