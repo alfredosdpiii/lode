@@ -47,6 +47,35 @@ def count_selects(statements: list[str], *fragments: str) -> int:
     return count
 
 
+def run_lode_json(data_dir: Path, *args: str, env: dict[str, str] | None = None) -> dict[str, Any]:
+    command_env = os.environ.copy()
+    if env:
+        command_env.update(env)
+    result = subprocess.run(
+        [sys.executable, "-m", "lode", "--data-dir", str(data_dir), *args],
+        check=True,
+        capture_output=True,
+        env=command_env,
+        text=True,
+        timeout=120,
+    )
+    return json.loads(result.stdout)
+
+
+def start_fake_embedding_server() -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+    FakeEmbeddingHandler.reset()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeEmbeddingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_port}"
+
+
+def stop_fake_embedding_server(server: ThreadingHTTPServer, thread: threading.Thread) -> None:
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+
+
 class LodeIndexTests(unittest.TestCase):
     def test_parse_file_with_explicit_text_matches_disk(self) -> None:
         with tempfile.TemporaryDirectory() as repo_tmp:
@@ -697,11 +726,8 @@ class LodeIndexTests(unittest.TestCase):
             write_sample_repo(repo)
             index_repo(repo, sqlite_path(data_dir))
 
-            server = ThreadingHTTPServer(("127.0.0.1", 0), FakeEmbeddingHandler)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            server, thread, url = start_fake_embedding_server()
             try:
-                url = f"http://127.0.0.1:{server.server_port}"
                 embed_result = subprocess.run(
                     [
                         sys.executable,
@@ -723,9 +749,7 @@ class LodeIndexTests(unittest.TestCase):
                     text=True,
                 )
             finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
+                stop_fake_embedding_server(server, thread)
 
             embed_payload = json.loads(embed_result.stdout)
             self.assertTrue(embed_payload["ok"])
@@ -736,14 +760,327 @@ class LodeIndexTests(unittest.TestCase):
                 dims = conn.execute("SELECT MIN(dims), MAX(dims) FROM embeddings").fetchone()
                 self.assertEqual(tuple(dims), (3, 3))
 
+    def test_cli_embed_honors_limit_and_no_pending_is_idempotent(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+            index_repo(repo, sqlite_path(data_dir))
+
+            server, thread, url = start_fake_embedding_server()
+            try:
+                with closing(connect(sqlite_path(data_dir))) as conn:
+                    before = embedding_counts(conn)
+                self.assertGreater(before["queued"], 2)
+
+                first = run_lode_json(
+                    data_dir,
+                    "embed",
+                    "--url",
+                    url,
+                    "--model",
+                    "fake-embedding-model",
+                    "--limit",
+                    "2",
+                    "--json",
+                )
+                self.assertEqual(first["embedded"], 2)
+                self.assertEqual(len(FakeEmbeddingHandler.requests), 1)
+                self.assertEqual(len(FakeEmbeddingHandler.requests[0]), 2)
+                with closing(connect(sqlite_path(data_dir))) as conn:
+                    after_first = embedding_counts(conn)
+                self.assertEqual(after_first["queued"], before["queued"] - 2)
+                self.assertEqual(after_first["embedded"], before["embedded"] + 2)
+
+                remaining = run_lode_json(
+                    data_dir,
+                    "embed",
+                    "--url",
+                    url,
+                    "--model",
+                    "fake-embedding-model",
+                    "--limit",
+                    "100",
+                    "--json",
+                )
+                self.assertEqual(remaining["embedded"], after_first["queued"])
+                self.assertEqual(len(FakeEmbeddingHandler.requests), 2)
+
+                no_pending = run_lode_json(
+                    data_dir,
+                    "embed",
+                    "--url",
+                    url,
+                    "--model",
+                    "fake-embedding-model",
+                    "--json",
+                )
+                self.assertTrue(no_pending["ok"])
+                self.assertEqual(no_pending["embedded"], 0)
+                self.assertEqual(no_pending["queued"], 0)
+                self.assertEqual(no_pending["total_embeddings"], before["queued"])
+                self.assertEqual(len(FakeEmbeddingHandler.requests), 2)
+            finally:
+                stop_fake_embedding_server(server, thread)
+
+    def test_cli_embed_fails_closed_without_local_endpoint(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                before = embedding_counts(conn)
+            command_env = os.environ.copy()
+            command_env.pop("LODE_EMBEDDINGS_URL", None)
+            command_env.pop("KG_EMBEDDINGS_URL", None)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "lode",
+                    "--data-dir",
+                    str(data_dir),
+                    "embed",
+                    "--json",
+                ],
+                capture_output=True,
+                env=command_env,
+                text=True,
+                timeout=120,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            payload = json.loads(result.stderr)
+            self.assertFalse(payload["ok"])
+            self.assertIn("No local embeddings endpoint configured", payload["error"])
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                self.assertEqual(embedding_counts(conn), before)
+
+    def test_cli_embed_rejects_hosted_endpoint_without_network_call(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+            index_repo(repo, sqlite_path(data_dir))
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "lode",
+                    "--data-dir",
+                    str(data_dir),
+                    "embed",
+                    "--url",
+                    "https://example.com",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            payload = json.loads(result.stderr)
+            self.assertFalse(payload["ok"])
+            self.assertIn("must be local", payload["error"])
+
+    def test_changed_content_refreshes_embedding_without_duplicate_rows(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "app.py").write_text(
+                "def target():\n    return 1\n",
+                encoding="utf-8",
+            )
+            index_repo(repo, sqlite_path(data_dir))
+
+            server, thread, url = start_fake_embedding_server()
+            try:
+                first = run_lode_json(
+                    data_dir,
+                    "embed",
+                    "--url",
+                    url,
+                    "--model",
+                    "first-model",
+                    "--limit",
+                    "1",
+                    "--json",
+                )
+                self.assertEqual(first["embedded"], 1)
+
+                with closing(connect(sqlite_path(data_dir))) as conn:
+                    node = find_symbol(conn, "target")[0]
+                    node_id = node["id"]
+                    before = conn.execute(
+                        "SELECT dims, vector_json, model, embedded_at FROM embeddings WHERE node_id = ?",
+                        (node_id,),
+                    ).fetchone()
+                    self.assertIsNotNone(before)
+
+                (repo / "app.py").write_text(
+                    "def target():\n    return 2\n",
+                    encoding="utf-8",
+                )
+                index_repo(repo, sqlite_path(data_dir))
+
+                with closing(connect(sqlite_path(data_dir))) as conn:
+                    node = find_symbol(conn, "target")[0]
+                    self.assertEqual(node["id"], node_id)
+                    queue = conn.execute(
+                        "SELECT embedded_at FROM embedding_queue WHERE node_id = ?",
+                        (node_id,),
+                    ).fetchone()
+                    self.assertIsNotNone(queue)
+                    self.assertIsNone(queue["embedded_at"])
+                    row_count = conn.execute(
+                        "SELECT COUNT(*) FROM embeddings WHERE node_id = ?",
+                        (node_id,),
+                    ).fetchone()[0]
+                    self.assertEqual(row_count, 1)
+
+                FakeEmbeddingHandler.vector_base = 100.0
+                second = run_lode_json(
+                    data_dir,
+                    "embed",
+                    "--url",
+                    url,
+                    "--model",
+                    "second-model",
+                    "--limit",
+                    "1",
+                    "--json",
+                )
+                self.assertEqual(second["embedded"], 1)
+                self.assertEqual(len(FakeEmbeddingHandler.requests), 2)
+
+                with closing(connect(sqlite_path(data_dir))) as conn:
+                    rows = list(
+                        conn.execute(
+                            "SELECT dims, vector_json, model, embedded_at FROM embeddings WHERE node_id = ?",
+                            (node_id,),
+                        )
+                    )
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["dims"], 3)
+                self.assertEqual(rows[0]["model"], "second-model")
+                self.assertNotEqual(rows[0]["vector_json"], before["vector_json"])
+                self.assertGreaterEqual(rows[0]["embedded_at"], before["embedded_at"])
+            finally:
+                stop_fake_embedding_server(server, thread)
+
+    def test_deleted_nodes_do_not_leave_embedding_artifacts(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "app.py").write_text(
+                "def deleted_target():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (repo / "keep.py").write_text(
+                "def kept_target():\n    return 2\n",
+                encoding="utf-8",
+            )
+            index_repo(repo, sqlite_path(data_dir))
+
+            server, thread, url = start_fake_embedding_server()
+            try:
+                payload = run_lode_json(
+                    data_dir,
+                    "embed",
+                    "--url",
+                    url,
+                    "--model",
+                    "fake-embedding-model",
+                    "--limit",
+                    "10",
+                    "--json",
+                )
+                self.assertGreaterEqual(payload["embedded"], 2)
+            finally:
+                stop_fake_embedding_server(server, thread)
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                deleted_node_ids = [
+                    row["id"]
+                    for row in conn.execute(
+                        "SELECT id FROM nodes WHERE owner_path = ?",
+                        ("app.py",),
+                    )
+                ]
+                self.assertTrue(deleted_node_ids)
+
+            (repo / "app.py").unlink()
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                orphaned_queue = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM embedding_queue q
+                    LEFT JOIN nodes n ON n.id = q.node_id
+                    WHERE n.id IS NULL
+                    """
+                ).fetchone()[0]
+                orphaned_embeddings = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM embeddings e
+                    LEFT JOIN nodes n ON n.id = e.node_id
+                    WHERE n.id IS NULL
+                    """
+                ).fetchone()[0]
+                self.assertEqual(orphaned_queue, 0)
+                self.assertEqual(orphaned_embeddings, 0)
+                for node_id in deleted_node_ids:
+                    queued = conn.execute(
+                        "SELECT COUNT(*) FROM embedding_queue WHERE node_id = ?",
+                        (node_id,),
+                    ).fetchone()[0]
+                    embedded = conn.execute(
+                        "SELECT COUNT(*) FROM embeddings WHERE node_id = ?",
+                        (node_id,),
+                    ).fetchone()[0]
+                    self.assertEqual(queued, 0)
+                    self.assertEqual(embedded, 0)
+
 
 class FakeEmbeddingHandler(BaseHTTPRequestHandler):
+    requests: list[list[str]] = []
+    vector_base: float = 0.0
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.requests = []
+        cls.vector_base = 0.0
+
     def do_POST(self) -> None:
         size = int(self.headers.get("content-length") or 0)
         body = json.loads(self.rfile.read(size).decode("utf-8"))
         inputs = body.get("inputs", [])
+        type(self).requests.append(list(inputs))
         vectors = [
-            [float(index), float(index + 1), float(len(text))] for index, text in enumerate(inputs)
+            [
+                type(self).vector_base + float(index),
+                type(self).vector_base + float(index + 1),
+                float(len(text)),
+            ]
+            for index, text in enumerate(inputs)
         ]
         payload = json.dumps(vectors).encode("utf-8")
         self.send_response(200)

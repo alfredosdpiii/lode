@@ -23,7 +23,7 @@ from .storage import (
     pending_embedding_nodes,
     repo_filter,
     search_nodes,
-    upsert_embedding,
+    upsert_embeddings,
 )
 
 
@@ -245,7 +245,13 @@ def cmd_embed(args: argparse.Namespace) -> int:
     with closing(connect(sqlite_path(args.data_dir))) as conn:
         nodes = pending_embedding_nodes(conn, limit=args.limit)
         if not nodes:
-            output = {"ok": True, "embedded": 0, **embedding_counts(conn)}
+            counts = embedding_counts(conn)
+            output = {
+                "ok": True,
+                **counts,
+                "total_embeddings": counts["embedded"],
+                "embedded": 0,
+            }
             emit(output, args.json)
             return 0
 
@@ -256,9 +262,20 @@ def cmd_embed(args: argparse.Namespace) -> int:
                 f"Embedding endpoint returned {len(vectors)} vectors for {len(nodes)} texts"
             )
         model = args.model or embeddings_model()
-        for node, vector in zip(nodes, vectors):
-            upsert_embedding(conn, node["id"], node["repo_id"], vector, model)
-        output = {"ok": True, "embedded": len(vectors), **embedding_counts(conn)}
+        upsert_embeddings(
+            conn,
+            [
+                (str(node["id"]), str(node["repo_id"]), vector, model)
+                for node, vector in zip(nodes, vectors)
+            ],
+        )
+        counts = embedding_counts(conn)
+        output = {
+            "ok": True,
+            **counts,
+            "total_embeddings": counts["embedded"],
+            "embedded": len(vectors),
+        }
     emit(output, args.json)
     return 0
 

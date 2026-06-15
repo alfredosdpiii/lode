@@ -102,6 +102,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             model TEXT NOT NULL,
             embedded_at REAL NOT NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_embedding_queue_pending
+        ON embedding_queue(repo_id, embedded_at, queued_at);
+
+        CREATE INDEX IF NOT EXISTS idx_embeddings_repo
+        ON embeddings(repo_id);
         """
     )
     conn.execute(
@@ -165,6 +171,15 @@ def replace_file_indexes_rows(
             "DELETE FROM node_fts WHERE node_id = ?",
             [(node_id,) for node_id in old_node_ids],
         )
+    deduped_nodes_by_path = {
+        file_index.path: dedupe_nodes(file_index.nodes) for file_index in file_indexes
+    }
+    deduped_edges_by_path = {
+        file_index.path: dedupe_edges(file_index.edges) for file_index in file_indexes
+    }
+    new_node_ids = {node.id for nodes in deduped_nodes_by_path.values() for node in nodes}
+    stale_node_ids = [node_id for node_id in old_node_ids if node_id not in new_node_ids]
+    delete_embedding_artifacts(conn, stale_node_ids)
     for path_group in chunked(paths, 400):
         placeholders = ",".join("?" for _ in path_group)
         conn.execute(
@@ -209,7 +224,7 @@ def replace_file_indexes_rows(
     queue_values: list[tuple[Any, ...]] = []
     edge_values: list[tuple[Any, ...]] = []
     for file_index in file_indexes:
-        deduped_nodes = dedupe_nodes(file_index.nodes)
+        deduped_nodes = deduped_nodes_by_path[file_index.path]
         for node in deduped_nodes:
             node_values.append(
                 (
@@ -235,7 +250,7 @@ def replace_file_indexes_rows(
                 and node.content_hash
             ):
                 queue_values.append((node.id, repo_id, node.content_hash, now))
-        deduped_edges = dedupe_edges(file_index.edges)
+        deduped_edges = deduped_edges_by_path[file_index.path]
         edge_values.extend(
             (
                 repo_id,
@@ -318,6 +333,21 @@ def chunked(items: list[str], size: int) -> list[list[str]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
+def delete_embedding_artifacts(conn: sqlite3.Connection, node_ids: list[str]) -> None:
+    if not node_ids:
+        return
+    for node_group in chunked(node_ids, 400):
+        placeholders = ",".join("?" for _ in node_group)
+        conn.execute(
+            f"DELETE FROM embedding_queue WHERE node_id IN ({placeholders})",  # nosec B608
+            node_group,
+        )
+        conn.execute(
+            f"DELETE FROM embeddings WHERE node_id IN ({placeholders})",  # nosec B608
+            node_group,
+        )
+
+
 def remove_missing_files(conn: sqlite3.Connection, repo_id: str, live_paths: set[str]) -> int:
     with conn:
         return remove_missing_file_rows(conn, repo_id, live_paths)
@@ -342,6 +372,7 @@ def remove_missing_file_rows(conn: sqlite3.Connection, repo_id: str, live_paths:
                 "DELETE FROM node_fts WHERE node_id = ?",
                 [(node_id,) for node_id in old_node_ids],
             )
+            delete_embedding_artifacts(conn, old_node_ids)
         conn.execute(
             "DELETE FROM edges WHERE repo_id = ? AND owner_path = ?",
             (repo_id, path),
@@ -894,6 +925,8 @@ def row_to_node_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def pending_embedding_nodes(conn: sqlite3.Connection, limit: int = 32) -> list[dict[str, Any]]:
+    if limit < 0:
+        raise ValueError("Embedding limit must be non-negative")
     rows = conn.execute(
         """
         SELECT n.*, 0.0 AS rank
@@ -916,10 +949,24 @@ def upsert_embedding(
     model: str,
     embedded_at: float | None = None,
 ) -> None:
+    upsert_embeddings(conn, [(node_id, repo_id, vector, model)], embedded_at=embedded_at)
+
+
+def upsert_embeddings(
+    conn: sqlite3.Connection,
+    rows: list[tuple[str, str, list[float], str]],
+    embedded_at: float | None = None,
+) -> None:
+    if not rows:
+        return
     now = embedded_at if embedded_at is not None else time.time()
-    vector_json = json.dumps(vector)
+    embedding_values = [
+        (node_id, repo_id, len(vector), json.dumps(vector), model, now)
+        for node_id, repo_id, vector, model in rows
+    ]
+    queue_values = [(now, node_id) for node_id, _repo_id, _vector, _model in rows]
     with conn:
-        conn.execute(
+        conn.executemany(
             """
             INSERT INTO embeddings(node_id, repo_id, dims, vector_json, model, embedded_at)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -930,11 +977,11 @@ def upsert_embedding(
               model=excluded.model,
               embedded_at=excluded.embedded_at
             """,
-            (node_id, repo_id, len(vector), vector_json, model, now),
+            embedding_values,
         )
-        conn.execute(
+        conn.executemany(
             "UPDATE embedding_queue SET embedded_at = ? WHERE node_id = ?",
-            (now, node_id),
+            queue_values,
         )
 
 

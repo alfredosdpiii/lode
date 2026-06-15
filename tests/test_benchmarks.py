@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from collections.abc import Callable
 from contextlib import closing
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +69,31 @@ def load_benchmark_script() -> Any:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class BenchmarkFakeEmbeddingHandler(BaseHTTPRequestHandler):
+    requests: list[list[str]] = []
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.requests = []
+
+    def do_POST(self) -> None:
+        size = int(self.headers.get("content-length") or 0)
+        body = json.loads(self.rfile.read(size).decode("utf-8"))
+        inputs = body.get("inputs", [])
+        type(self).requests.append(list(inputs))
+        vectors = [[float(index)] * 384 for index, _text in enumerate(inputs)]
+        payload = json.dumps(vectors).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: object) -> None:
+        _ = (format, args)
+        return
 
 
 class BenchmarkScriptTests(unittest.TestCase):
@@ -397,6 +425,74 @@ class BenchmarkScriptTests(unittest.TestCase):
         self.assertIn("node_id", neighbors)
         self.assertIn("timing_ms", neighbors)
         self.assertTrue(neighbors["incoming"] + neighbors["outgoing"] > 0)
+
+    def test_embedding_benchmark_honors_limit_and_reports_batch_count(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            (repo / "many.py").write_text(
+                "\n\n".join(f"def function_{index}():\n    return {index}" for index in range(40))
+                + "\n",
+                encoding="utf-8",
+            )
+            BenchmarkFakeEmbeddingHandler.reset()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), BenchmarkFakeEmbeddingHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            env = os.environ.copy()
+            env["LODE_EMBEDDINGS_MODEL"] = "Snowflake/snowflake-arctic-embed-s"
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "scripts/bench_lode.py",
+                        "--repo",
+                        str(repo),
+                        "--data-dir",
+                        data_tmp,
+                        "--reset",
+                        "--repeat",
+                        "1",
+                        "--query",
+                        "function",
+                        "--symbol",
+                        "function_0",
+                        "--embed-url",
+                        f"http://127.0.0.1:{server.server_port}",
+                        "--embed-limit",
+                        "32",
+                        "--json",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    cwd=PROJECT_ROOT,
+                    env=env,
+                    text=True,
+                    timeout=120,
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(len(BenchmarkFakeEmbeddingHandler.requests), 1)
+        self.assertEqual(len(BenchmarkFakeEmbeddingHandler.requests[0]), 32)
+        embeddings = payload["embeddings"]
+        self.assertEqual(embeddings["embedded"], 32)
+        self.assertEqual(embeddings["dims"], 384)
+        self.assertEqual(embeddings["model"], "Snowflake/snowflake-arctic-embed-s")
+        self.assertEqual(
+            payload["database_after_embeddings"]["counts"]["embeddings"],
+            payload["database"]["counts"]["embeddings"] + 32,
+        )
+        self.assertEqual(
+            embeddings["queued"],
+            payload["database"]["counts"]["embedding_queue"] - embeddings["embedded"],
+        )
 
     def test_repobench_adapter_scores_synthetic_sample(self) -> None:
         with tempfile.TemporaryDirectory() as data_tmp:
