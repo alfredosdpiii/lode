@@ -366,6 +366,167 @@ class BenchmarkScriptTests(unittest.TestCase):
         self.assertEqual(payload["samples_evaluated"], 1)
         self.assertGreaterEqual(payload["metrics"]["hit_at_3"], 1.0)
 
+    def test_repobench_adapter_full_diagnostics_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as data_tmp:
+            root = Path(data_tmp)
+            first = root / "cross_file_first.jsonl"
+            random = root / "cross_file_random.jsonl"
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "dataset": "tianyang/repobench_python_v1.1",
+                        "jsonl_files": [str(first), str(random)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sample = {
+                "idx": 0,
+                "repo_name": "synthetic",
+                "file_path": "app.py",
+                "cropped_code": APP_CODE.rstrip("\n"),
+                "context": [
+                    {
+                        "identifier": "UserService",
+                        "path": "services.py",
+                        "snippet": SERVICE_CODE.rstrip("\n"),
+                    },
+                    {
+                        "identifier": "unrelated",
+                        "path": "other.py",
+                        "snippet": "def unrelated():\n    return None",
+                    },
+                ],
+                "gold_snippet_index": 0,
+                "next_line": "    return service.save_user(name)",
+                "level": "2k",
+            }
+            first.write_text(json.dumps(sample) + "\n", encoding="utf-8")
+            random.write_text(json.dumps(sample) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "benchmarks/repobench_adapter.py",
+                    "--input",
+                    str(root),
+                    "--mode",
+                    "context",
+                    "--top-k",
+                    "1",
+                    "3",
+                    "5",
+                    "10",
+                    "--query-lines",
+                    "5",
+                    "--search-limit",
+                    "30",
+                    "--context-budget",
+                    "6000",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        # Top-level diagnostics schema
+        self.assertEqual(payload["dataset"], "tianyang/repobench_python_v1.1")
+        self.assertEqual(
+            payload["input_files"], ["cross_file_first.jsonl", "cross_file_random.jsonl"]
+        )
+        self.assertEqual(payload["splits"], ["cross_file_first", "cross_file_random"])
+        self.assertEqual(payload["samples_evaluated"], 2)
+        self.assertEqual(payload["samples_skipped"], 0)
+        self.assertIn("hit_counts", payload)
+        self.assertIn("reciprocal_rank_sum", payload)
+        # Split results
+        self.assertIn("split_results", payload)
+        for split_name in ["cross_file_first", "cross_file_random"]:
+            split = payload["split_results"][split_name]
+            self.assertEqual(split["split"], split_name)
+            self.assertEqual(split["dataset"], "tianyang/repobench_python_v1.1")
+            self.assertEqual(split["samples_evaluated"], 1)
+            self.assertEqual(split["samples_skipped"], 0)
+            self.assertIn("hit_counts", split)
+            self.assertIn("reciprocal_rank_sum", split)
+            # Buckets
+            self.assertIn("by_bucket", split)
+            for bucket in ["lt5_candidates", "easy_5_9_candidates", "hard_10_plus_candidates"]:
+                self.assertIn(bucket, split["by_bucket"])
+                bucket_data = split["by_bucket"][bucket]
+                self.assertIn("samples_evaluated", bucket_data)
+                self.assertIn("metrics", bucket_data)
+                self.assertIn("hit_counts", bucket_data)
+                self.assertIn("reciprocal_rank_sum", bucket_data)
+            # Levels
+            self.assertIn("by_level", split)
+            self.assertIn("2k", split["by_level"])
+            level_data = split["by_level"]["2k"]
+            self.assertEqual(level_data["samples_evaluated"], 1)
+            self.assertIn("metrics", level_data)
+            self.assertIn("hit_counts", level_data)
+            self.assertIn("reciprocal_rank_sum", level_data)
+
+    def test_repobench_adapter_exact_skip_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as data_tmp:
+            input_path = Path(data_tmp) / "repobench.jsonl"
+            # Sample with invalid gold_snippet_index
+            sample = {
+                "idx": 0,
+                "repo_name": "synthetic",
+                "file_path": "app.py",
+                "cropped_code": APP_CODE.rstrip("\n"),
+                "context": [
+                    {
+                        "identifier": "UserService",
+                        "path": "services.py",
+                        "snippet": SERVICE_CODE.rstrip("\n"),
+                    },
+                ],
+                "gold_snippet_index": 5,  # invalid: only 1 context item
+                "next_line": "    return service.save_user(name)",
+            }
+            input_path.write_text(json.dumps(sample) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "benchmarks/repobench_adapter.py",
+                    "--input",
+                    str(input_path),
+                    "--top-k",
+                    "1",
+                    "3",
+                    "--query-lines",
+                    "5",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["samples_evaluated"], 0)
+        self.assertEqual(payload["samples_skipped"], 1)
+        # Error identity
+        self.assertEqual(len(payload["errors"]), 1)
+        error = payload["errors"][0]
+        self.assertEqual(error["sample_id"], "repobench.jsonl:1")
+        self.assertEqual(error["line"], 1)
+        self.assertIn("gold_snippet_index is outside context list", error["error"])
+        # Split-level error
+        split = payload["split_results"]["repobench"]
+        self.assertEqual(split["samples_skipped"], 1)
+        self.assertEqual(len(split["errors"]), 1)
+        self.assertEqual(split["errors"][0]["sample_id"], "repobench.jsonl:1")
+        self.assertEqual(split["errors"][0]["line"], 1)
+
 
 def write_sample_repo(repo: Path) -> None:
     (repo / "app.py").write_text(APP_CODE, encoding="utf-8")

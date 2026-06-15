@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -11,6 +10,7 @@ import tempfile
 import time
 from collections.abc import Iterable
 from contextlib import closing
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from statistics import mean
 from typing import Any
@@ -19,6 +19,25 @@ from lode.config import sqlite_path
 from lode.context import build_context_pack
 from lode.indexer import index_repo
 from lode.storage import connect, search_nodes
+
+
+@dataclass
+class _Accumulator:
+    hits: dict[int, int] = field(default_factory=lambda: {})
+    reciprocal_ranks: list[float] = field(default_factory=list)
+    index_timings: list[float] = field(default_factory=list)
+    retrieve_timings: list[float] = field(default_factory=list)
+    errors: list[dict[str, Any]] = field(default_factory=list)
+    evaluated: int = 0
+    skipped: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.hits:
+            self.hits = {}
+
+
+def _make_acc(top_k: list[int]) -> _Accumulator:
+    return _Accumulator(hits={k: 0 for k in top_k})
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -78,25 +97,41 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if not top_k:
         raise ValueError("--top-k must contain at least one positive integer")
 
-    rows = []
-    errors = []
-    reciprocal_ranks = []
-    hits = {k: 0 for k in top_k}
-    evaluated = 0
-    skipped = 0
-    index_timings = []
-    retrieve_timings = []
+    dataset = _resolve_dataset(input_path)
+    input_files = _resolve_input_files(input_path)
+    split_names = [f.stem for f in input_files]
+
+    # Per-split accumulators
+    split_accs: dict[str, _Accumulator] = {}
+    for name in split_names:
+        split_accs[name] = _make_acc(top_k)
+
+    # Bucket and level accumulators per split
+    split_buckets: dict[str, dict[str, _Accumulator]] = {}
+    split_levels: dict[str, dict[str, _Accumulator]] = {}
+    for name in split_names:
+        split_buckets[name] = {
+            "lt5_candidates": _make_acc(top_k),
+            "easy_5_9_candidates": _make_acc(top_k),
+            "hard_10_plus_candidates": _make_acc(top_k),
+        }
+        split_levels[name] = {}
+
+    details_rows: list[dict[str, Any]] = []
+    all_errors: list[dict[str, Any]] = []
 
     with tempfile.TemporaryDirectory(prefix="lode-repobench-") as temp_root:
         root = Path(temp_root)
         for raw_index, (source, line_no, sample) in enumerate(iter_samples(input_path)):
             if raw_index < args.start:
                 continue
-            if args.limit is not None and evaluated >= args.limit:
-                break
-            sample_id = str(sample.get("idx") or f"{source.name}:{line_no}")
+            split_name = source.stem
+            split_acc = split_accs[split_name]
+            if args.limit is not None and split_acc.evaluated >= args.limit:
+                continue
+            sample_id = f"{source.name}:{line_no}"
             try:
-                sample_root = root / f"sample-{evaluated:06d}"
+                sample_root = root / f"sample-{split_name}-{split_acc.evaluated:06d}"
                 repo_dir = sample_root / "repo"
                 data_dir = sample_root / "data"
                 repo_dir.mkdir(parents=True)
@@ -119,18 +154,18 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                         )
                     )
                 rank = first_rank(ranked_paths, target_path)
-                evaluated += 1
-                index_timings.append(index_ms)
-                retrieve_timings.append(retrieve_ms)
+                split_acc.evaluated += 1
+                split_acc.index_timings.append(index_ms)
+                split_acc.retrieve_timings.append(retrieve_ms)
                 if rank is not None:
-                    reciprocal_ranks.append(1.0 / rank)
+                    split_acc.reciprocal_ranks.append(1.0 / rank)
                     for k in top_k:
                         if rank <= k:
-                            hits[k] += 1
+                            split_acc.hits[k] += 1
                 else:
-                    reciprocal_ranks.append(0.0)
+                    split_acc.reciprocal_ranks.append(0.0)
                 if args.details:
-                    rows.append(
+                    details_rows.append(
                         {
                             "sample_id": sample_id,
                             "target_path": target_path,
@@ -141,6 +176,47 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             "retrieve_ms": round(retrieve_ms, 3),
                         }
                     )
+
+                # Bucket and level tracking
+                contexts = sample.get("context")
+                context_count = len(contexts) if isinstance(contexts, list) else 0
+                if context_count < 5:
+                    bucket_name = "lt5_candidates"
+                elif context_count <= 9:
+                    bucket_name = "easy_5_9_candidates"
+                else:
+                    bucket_name = "hard_10_plus_candidates"
+                bucket_acc = split_buckets[split_name][bucket_name]
+                bucket_acc.evaluated += 1
+                bucket_acc.index_timings.append(index_ms)
+                bucket_acc.retrieve_timings.append(retrieve_ms)
+                if rank is not None:
+                    bucket_acc.reciprocal_ranks.append(1.0 / rank)
+                    for k in top_k:
+                        if rank <= k:
+                            bucket_acc.hits[k] += 1
+                else:
+                    bucket_acc.reciprocal_ranks.append(0.0)
+
+                level = sample.get("level")
+                if isinstance(level, str):
+                    level_name = level
+                else:
+                    level_name = "unknown"
+                if level_name not in split_levels[split_name]:
+                    split_levels[split_name][level_name] = _make_acc(top_k)
+                level_acc = split_levels[split_name][level_name]
+                level_acc.evaluated += 1
+                level_acc.index_timings.append(index_ms)
+                level_acc.retrieve_timings.append(retrieve_ms)
+                if rank is not None:
+                    level_acc.reciprocal_ranks.append(1.0 / rank)
+                    for k in top_k:
+                        if rank <= k:
+                            level_acc.hits[k] += 1
+                else:
+                    level_acc.reciprocal_ranks.append(0.0)
+
             except (
                 KeyError,
                 IndexError,
@@ -149,31 +225,190 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 OSError,
                 sqlite3.Error,
             ) as exc:
-                skipped += 1
-                errors.append({"sample_id": sample_id, "error": str(exc)})
+                split_acc.skipped += 1
+                error_obj = {"sample_id": sample_id, "error": str(exc), "line": line_no}
+                all_errors.append(error_obj)
+                split_acc.errors.append(error_obj)
                 if args.fail_fast:
                     raise ValueError(f"failed on {sample_id}: {exc}") from exc
             finally:
                 if "sample_root" in locals() and sample_root.exists():
                     shutil.rmtree(sample_root)
 
-    metrics = {f"hit_at_{k}": round(hits[k] / evaluated, 6) if evaluated else 0.0 for k in top_k}
-    metrics["mrr"] = round(mean(reciprocal_ranks), 6) if reciprocal_ranks else 0.0
+    # Build split results
+    split_results: dict[str, Any] = {}
+    for split_name in split_names:
+        acc = split_accs[split_name]
+        split_results[split_name] = _build_split_result(
+            split_name,
+            acc,
+            split_buckets[split_name],
+            split_levels[split_name],
+            top_k,
+            dataset,
+            args,
+        )
+
+    # Build combined result
+    total_evaluated = sum(acc.evaluated for acc in split_accs.values())
+    total_skipped = sum(acc.skipped for acc in split_accs.values())
+    all_hits = {k: sum(acc.hits[k] for acc in split_accs.values()) for k in top_k}
+    all_rrs = [rr for acc in split_accs.values() for rr in acc.reciprocal_ranks]
+    all_index_timings = [t for acc in split_accs.values() for t in acc.index_timings]
+    all_retrieve_timings = [t for acc in split_accs.values() for t in acc.retrieve_timings]
+
+    combined_metrics = {
+        f"hit_at_{k}": round(all_hits[k] / total_evaluated, 6) if total_evaluated else 0.0
+        for k in top_k
+    }
+    combined_metrics["mrr"] = round(mean(all_rrs), 6) if all_rrs else 0.0
+
     return {
         "ok": True,
         "input": str(input_path),
+        "dataset": dataset,
+        "input_files": [f.name for f in input_files],
+        "splits": split_names,
         "mode": args.mode,
-        "samples_evaluated": evaluated,
-        "samples_skipped": skipped,
+        "samples_evaluated": total_evaluated,
+        "samples_skipped": total_skipped,
         "top_k": top_k,
-        "metrics": metrics,
+        "query_lines": args.query_lines,
+        "search_limit": args.search_limit,
+        "context_budget": args.context_budget,
+        "metrics": combined_metrics,
+        "hit_counts": {f"hit_at_{k}": all_hits[k] for k in top_k},
+        "reciprocal_rank_sum": round(sum(all_rrs), 6) if all_rrs else 0.0,
         "timing_ms": {
-            "index_mean": round(mean(index_timings), 3) if index_timings else 0.0,
-            "retrieve_mean": round(mean(retrieve_timings), 3) if retrieve_timings else 0.0,
+            "index_mean": round(mean(all_index_timings), 3) if all_index_timings else 0.0,
+            "retrieve_mean": round(mean(all_retrieve_timings), 3) if all_retrieve_timings else 0.0,
         },
-        "details": rows if args.details else [],
-        "errors": errors[:20],
+        "split_results": split_results,
+        "details": details_rows if args.details else [],
+        "errors": all_errors[:20],
     }
+
+
+def _build_split_result(
+    split_name: str,
+    acc: _Accumulator,
+    buckets: dict[str, _Accumulator],
+    levels: dict[str, _Accumulator],
+    top_k: list[int],
+    dataset: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    metrics = {
+        f"hit_at_{k}": round(acc.hits[k] / acc.evaluated, 6) if acc.evaluated else 0.0
+        for k in top_k
+    }
+    metrics["mrr"] = round(mean(acc.reciprocal_ranks), 6) if acc.reciprocal_ranks else 0.0
+
+    by_bucket: dict[str, Any] = {}
+    for bucket_name, bucket_acc in buckets.items():
+        bucket_metrics = {
+            f"hit_at_{k}": round(bucket_acc.hits[k] / bucket_acc.evaluated, 6)
+            if bucket_acc.evaluated
+            else 0.0
+            for k in top_k
+        }
+        bucket_metrics["mrr"] = (
+            round(mean(bucket_acc.reciprocal_ranks), 6) if bucket_acc.reciprocal_ranks else 0.0
+        )
+        by_bucket[bucket_name] = {
+            "samples_evaluated": bucket_acc.evaluated,
+            "samples_skipped": bucket_acc.skipped,
+            "metrics": bucket_metrics,
+            "hit_counts": {f"hit_at_{k}": bucket_acc.hits[k] for k in top_k},
+            "reciprocal_rank_sum": round(sum(bucket_acc.reciprocal_ranks), 6)
+            if bucket_acc.reciprocal_ranks
+            else 0.0,
+            "timing_ms": {
+                "index_mean": round(mean(bucket_acc.index_timings), 3)
+                if bucket_acc.index_timings
+                else 0.0,
+                "retrieve_mean": round(mean(bucket_acc.retrieve_timings), 3)
+                if bucket_acc.retrieve_timings
+                else 0.0,
+            },
+            "errors": bucket_acc.errors[:20],
+        }
+
+    by_level: dict[str, Any] = {}
+    for level_name, level_acc in levels.items():
+        level_metrics = {
+            f"hit_at_{k}": round(level_acc.hits[k] / level_acc.evaluated, 6)
+            if level_acc.evaluated
+            else 0.0
+            for k in top_k
+        }
+        level_metrics["mrr"] = (
+            round(mean(level_acc.reciprocal_ranks), 6) if level_acc.reciprocal_ranks else 0.0
+        )
+        by_level[level_name] = {
+            "samples_evaluated": level_acc.evaluated,
+            "samples_skipped": level_acc.skipped,
+            "metrics": level_metrics,
+            "hit_counts": {f"hit_at_{k}": level_acc.hits[k] for k in top_k},
+            "reciprocal_rank_sum": round(sum(level_acc.reciprocal_ranks), 6)
+            if level_acc.reciprocal_ranks
+            else 0.0,
+            "timing_ms": {
+                "index_mean": round(mean(level_acc.index_timings), 3)
+                if level_acc.index_timings
+                else 0.0,
+                "retrieve_mean": round(mean(level_acc.retrieve_timings), 3)
+                if level_acc.retrieve_timings
+                else 0.0,
+            },
+            "errors": level_acc.errors[:20],
+        }
+
+    return {
+        "ok": True,
+        "split": split_name,
+        "dataset": dataset,
+        "mode": args.mode,
+        "samples_evaluated": acc.evaluated,
+        "samples_skipped": acc.skipped,
+        "top_k": top_k,
+        "query_lines": args.query_lines,
+        "search_limit": args.search_limit,
+        "context_budget": args.context_budget,
+        "metrics": metrics,
+        "hit_counts": {f"hit_at_{k}": acc.hits[k] for k in top_k},
+        "reciprocal_rank_sum": round(sum(acc.reciprocal_ranks), 6) if acc.reciprocal_ranks else 0.0,
+        "timing_ms": {
+            "index_mean": round(mean(acc.index_timings), 3) if acc.index_timings else 0.0,
+            "retrieve_mean": round(mean(acc.retrieve_timings), 3) if acc.retrieve_timings else 0.0,
+        },
+        "by_bucket": by_bucket,
+        "by_level": by_level,
+        "errors": acc.errors[:20],
+    }
+
+
+def _resolve_dataset(input_path: Path) -> str:
+    manifest_path = input_path / ".." / "manifest.json"
+    if not manifest_path.resolve().exists():
+        manifest_path = input_path.parent / "manifest.json"
+    if manifest_path.resolve().exists():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and "dataset" in data:
+                return str(data["dataset"])
+        except (OSError, json.JSONDecodeError):
+            pass
+    return "tianyang/repobench_python_v1.1"
+
+
+def _resolve_input_files(input_path: Path) -> list[Path]:
+    if input_path.is_dir():
+        files = sorted(input_path.glob("*.jsonl"))
+    else:
+        files = [input_path]
+    return files
 
 
 def iter_samples(path: Path) -> Iterable[tuple[Path, int, dict[str, Any]]]:
@@ -303,7 +538,9 @@ def timed(func):
 def print_summary(result: dict[str, Any]) -> None:
     print("RepoBench-style Lode retrieval benchmark")
     print(f"input: {result['input']}")
+    print(f"dataset: {result.get('dataset', 'unknown')}")
     print(f"mode: {result['mode']}")
+    print(f"splits: {', '.join(result.get('splits', []))}")
     print(f"samples: evaluated={result['samples_evaluated']} skipped={result['samples_skipped']}")
     for name, value in result["metrics"].items():
         print(f"{name}: {value:.6f}")
@@ -312,6 +549,12 @@ def print_summary(result: dict[str, Any]) -> None:
         f"index={result['timing_ms']['index_mean']:.3f} "
         f"retrieve={result['timing_ms']['retrieve_mean']:.3f}"
     )
+    if result.get("split_results"):
+        print("split results:")
+        for split_name, split_data in result["split_results"].items():
+            print(
+                f"  {split_name}: evaluated={split_data['samples_evaluated']} skipped={split_data['samples_skipped']}"
+            )
 
 
 if __name__ == "__main__":
