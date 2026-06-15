@@ -48,9 +48,18 @@ def write_state(path: Path, assertion_ids: list[str], *, pending: set[str] | Non
 
 
 class FakeCommandExecutor:
-    def __init__(self, gate_module: Any, *, pollute_repo: Path | None = None) -> None:
+    def __init__(
+        self,
+        gate_module: Any,
+        *,
+        pollute_repo: Path | None = None,
+        hosted_benchmark_output: bool = False,
+        fail_compare: str | None = None,
+    ) -> None:
         self._gate_module = gate_module
         self._pollute_repo = pollute_repo
+        self._hosted_benchmark_output = hosted_benchmark_output
+        self._fail_compare = fail_compare
         self.calls: list[str] = []
 
     def run(
@@ -70,15 +79,20 @@ class FakeCommandExecutor:
         stdout = ""
         if spec.name.startswith("benchmark_"):
             stdout = json.dumps({"ok": True, "parameters": {}})
+            if self._hosted_benchmark_output and spec.name == "benchmark_operational":
+                stdout = json.dumps({"ok": True, "log": "unexpected https://example.com/upload"})
         if spec.name.startswith("compare_"):
+            exit_code = 1 if spec.name == self._fail_compare else 0
             stdout = json.dumps(
                 {
                     "ok": True,
-                    "overall_pass": True,
-                    "metrics": {"fixture.metric": {"pass": True}},
+                    "overall_pass": exit_code == 0,
+                    "metrics": {"fixture.metric": {"pass": exit_code == 0}},
                     "split_results": {},
                 }
             )
+        else:
+            exit_code = 0
         stdout_path = output_dir / f"{spec.name}.stdout"
         stderr_path = output_dir / f"{spec.name}.stderr"
         stdout_path.write_text(stdout, encoding="utf-8")
@@ -86,7 +100,7 @@ class FakeCommandExecutor:
         return self._gate_module.CommandResult(
             name=spec.name,
             command=spec.command,
-            exit_code=0,
+            exit_code=exit_code,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             duration_seconds=0.01,
@@ -96,8 +110,9 @@ class FakeCommandExecutor:
 
 
 class FakeServiceManager:
-    def __init__(self, gate_module: Any) -> None:
+    def __init__(self, gate_module: Any, *, fail_stop: bool = False) -> None:
         self._gate_module = gate_module
+        self._fail_stop = fail_stop
         self.started: list[str] = []
         self.stopped: list[str] = []
 
@@ -109,7 +124,12 @@ class FakeServiceManager:
     def stop_started(self, run: Any, evidence_dir: Path) -> Any:
         _ = evidence_dir
         self.stopped.append(run.name)
-        return self._gate_module.ServiceStop(name=run.name, ok=True, evidence=[])
+        return self._gate_module.ServiceStop(
+            name=run.name,
+            ok=not self._fail_stop,
+            evidence=[],
+            failure_reason="fixture stop failure" if self._fail_stop else "",
+        )
 
 
 class FinalQualityGateTests(unittest.TestCase):
@@ -222,6 +242,90 @@ class FinalQualityGateTests(unittest.TestCase):
         matrix = {row["assertion_id"]: row for row in result["assertion_matrix"]}
         self.assertEqual(matrix["VAL-CROSS-005"]["status"], "fail")
         self.assertIn("git status changed", matrix["VAL-CROSS-005"]["failure_reason"])
+
+    def test_gate_fails_when_service_cleanup_fails(self) -> None:
+        gate_module = load_gate_script()
+        assertion_ids = ["VAL-CROSS-001", "VAL-CROSS-004", "VAL-CROSS-007"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contract_path = root / "validation-contract.md"
+            state_path = root / "validation-state.json"
+            write_contract(contract_path, assertion_ids)
+            write_state(state_path, assertion_ids)
+            service_manager = FakeServiceManager(gate_module, fail_stop=True)
+            gate = gate_module.FinalQualityGate(
+                project_root=PROJECT_ROOT,
+                evidence_dir=root / "evidence",
+                contract_path=contract_path,
+                assertion_state_path=state_path,
+                command_executor=FakeCommandExecutor(gate_module),
+                service_manager=service_manager,
+            )
+
+            result = gate.run()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["checks"]["cleanup"]["status"], "fail")
+        matrix = {row["assertion_id"]: row for row in result["assertion_matrix"]}
+        self.assertEqual(matrix["VAL-CROSS-004"]["status"], "fail")
+        self.assertIn("fixture stop failure", matrix["VAL-CROSS-004"]["failure_reason"])
+        self.assertEqual(matrix["VAL-CROSS-007"]["status"], "fail")
+
+    def test_gate_fails_when_local_first_scan_finds_hosted_endpoint(self) -> None:
+        gate_module = load_gate_script()
+        assertion_ids = ["VAL-CROSS-001", "VAL-CROSS-006", "VAL-CROSS-007"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contract_path = root / "validation-contract.md"
+            state_path = root / "validation-state.json"
+            write_contract(contract_path, assertion_ids)
+            write_state(state_path, assertion_ids)
+            gate = gate_module.FinalQualityGate(
+                project_root=PROJECT_ROOT,
+                evidence_dir=root / "evidence",
+                contract_path=contract_path,
+                assertion_state_path=state_path,
+                command_executor=FakeCommandExecutor(gate_module, hosted_benchmark_output=True),
+                service_manager=FakeServiceManager(gate_module),
+            )
+
+            result = gate.run()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["local_first"]["status"], "fail")
+        matrix = {row["assertion_id"]: row for row in result["assertion_matrix"]}
+        self.assertEqual(matrix["VAL-CROSS-006"]["status"], "fail")
+        self.assertIn("hosted URL detected", matrix["VAL-CROSS-006"]["failure_reason"])
+        self.assertEqual(matrix["VAL-CROSS-007"]["status"], "fail")
+
+    def test_gate_fails_when_benchmark_comparison_fails(self) -> None:
+        gate_module = load_gate_script()
+        assertion_ids = ["VAL-CROSS-001", "VAL-CROSS-007"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contract_path = root / "validation-contract.md"
+            state_path = root / "validation-state.json"
+            write_contract(contract_path, assertion_ids)
+            write_state(state_path, assertion_ids)
+            gate = gate_module.FinalQualityGate(
+                project_root=PROJECT_ROOT,
+                evidence_dir=root / "evidence",
+                contract_path=contract_path,
+                assertion_state_path=state_path,
+                command_executor=FakeCommandExecutor(
+                    gate_module, fail_compare="compare_operational"
+                ),
+                service_manager=FakeServiceManager(gate_module),
+            )
+
+            result = gate.run()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["checks"]["benchmark_comparison"]["status"], "fail")
+        matrix = {row["assertion_id"]: row for row in result["assertion_matrix"]}
+        self.assertEqual(matrix["VAL-CROSS-001"]["status"], "fail")
+        self.assertIn("benchmark", matrix["VAL-CROSS-001"]["failure_reason"])
+        self.assertEqual(matrix["VAL-CROSS-007"]["status"], "fail")
 
 
 if __name__ == "__main__":

@@ -373,7 +373,7 @@ class FinalQualityGate:
             self._stop_started_services()
             after = capture_snapshot("after", self.project_root, self.evidence_dir)
             self.artifacts.append(Path(after["artifact_path"]))
-            cleanup_status = compare_cleanup(before, after)
+            cleanup_status = compare_cleanup(before, after, self.service_stops)
             artifact_status = compare_artifact_hygiene(before, after, self.evidence_dir)
             local_first_status = self._check_local_first()
 
@@ -772,7 +772,9 @@ def temp_dir_snapshot() -> list[str]:
     return sorted(dirs)
 
 
-def compare_cleanup(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+def compare_cleanup(
+    before: dict[str, Any], after: dict[str, Any], service_stops: list[ServiceStop] | None = None
+) -> dict[str, Any]:
     issues = []
     if before["ports"] != after["ports"]:
         issues.append("port snapshot changed for 7979 or 7980")
@@ -794,6 +796,11 @@ def compare_cleanup(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
     new_temp_dirs = sorted(after_temp_dirs - before_temp_dirs)
     if new_temp_dirs:
         issues.append(f"mission temp directories remain: {new_temp_dirs}")
+
+    for stop in service_stops or []:
+        if not stop.ok:
+            reason = f": {stop.failure_reason}" if stop.failure_reason else ""
+            issues.append(f"service {stop.name} cleanup failed{reason}")
 
     return {
         "status": "pass" if not issues else "fail",
