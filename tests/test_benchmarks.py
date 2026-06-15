@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
+from typing import Any
+
+from lode.config import sqlite_path
+from lode.indexer import index_repo
+from lode.storage import connect, find_symbol
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,6 +34,38 @@ SERVICE_CODE = """class UserService:
 def write_sample_repo(repo: Path) -> None:
     (repo / "app.py").write_text(APP_CODE, encoding="utf-8")
     (repo / "services.py").write_text(SERVICE_CODE, encoding="utf-8")
+
+
+def trace_statements(conn: sqlite3.Connection, operation: Callable[[], object]) -> list[str]:
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        operation()
+    finally:
+        conn.set_trace_callback(None)
+    return statements
+
+
+def count_selects(statements: list[str], *fragments: str) -> int:
+    count = 0
+    for statement in statements:
+        normalized = " ".join(statement.split())
+        if normalized.upper().startswith("SELECT") and all(
+            fragment in normalized for fragment in fragments
+        ):
+            count += 1
+    return count
+
+
+def load_benchmark_script() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "lode_benchmark_script", PROJECT_ROOT / "scripts" / "bench_lode.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load benchmark script")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class BenchmarkScriptTests(unittest.TestCase):
@@ -240,6 +281,40 @@ class BenchmarkScriptTests(unittest.TestCase):
                 0 <= summary["min"] <= summary["p50"] <= summary["p95"] <= summary["max"],
                 f"{section}.{key} timing order violation: {summary}",
             )
+
+    def test_benchmark_timing_loops_execute_sqlite_each_repeat(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                bench_lode = load_benchmark_script()
+                node_id = find_symbol(conn, "create_user", limit=5)[0]["id"]
+
+                search_trace = trace_statements(
+                    conn, lambda: bench_lode.benchmark_search(conn, ["create user"], 3, 5)
+                )
+                self.assertGreaterEqual(count_selects(search_trace, "FROM node_fts"), 3)
+
+                symbol_trace = trace_statements(
+                    conn, lambda: bench_lode.benchmark_symbols(conn, ["create_user"], 3, 5)
+                )
+                self.assertGreaterEqual(count_selects(symbol_trace, "FROM nodes"), 3)
+
+                context_trace = trace_statements(
+                    conn, lambda: bench_lode.benchmark_context(conn, ["create user"], 3, 2000, 5)
+                )
+                self.assertGreaterEqual(count_selects(context_trace, "FROM node_fts"), 3)
+
+                neighbors_trace = trace_statements(
+                    conn, lambda: bench_lode.benchmark_neighbors(conn, node_id, 3)
+                )
+                self.assertGreaterEqual(count_selects(neighbors_trace, "FROM edges e"), 6)
 
     def test_operational_benchmark_json_shape(self) -> None:
         with (

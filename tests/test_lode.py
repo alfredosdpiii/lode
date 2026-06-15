@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +24,27 @@ from lode.storage import (
     get_neighbors,
     search_nodes,
 )
+
+
+def trace_statements(conn: sqlite3.Connection, operation: Callable[[], object]) -> list[str]:
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        operation()
+    finally:
+        conn.set_trace_callback(None)
+    return statements
+
+
+def count_selects(statements: list[str], *fragments: str) -> int:
+    count = 0
+    for statement in statements:
+        normalized = " ".join(statement.split())
+        if normalized.upper().startswith("SELECT") and all(
+            fragment in normalized for fragment in fragments
+        ):
+            count += 1
+    return count
 
 
 class LodeIndexTests(unittest.TestCase):
@@ -218,6 +241,43 @@ class LodeIndexTests(unittest.TestCase):
                     neighbors = get_neighbors(conn, related["node_id"], limit=16)
                     self.assertEqual(related["incoming"], compact_neighbors(neighbors["incoming"]))
                     self.assertEqual(related["outgoing"], compact_neighbors(neighbors["outgoing"]))
+
+    def test_repeated_query_context_and_graph_lookups_execute_sqlite(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                target = find_symbol(conn, "create_user", limit=5)[0]
+
+                search_nodes(conn, "create user", limit=5)
+                search_trace = trace_statements(
+                    conn, lambda: search_nodes(conn, "create user", limit=5)
+                )
+                self.assertGreaterEqual(count_selects(search_trace, "FROM node_fts"), 1)
+
+                symbol_trace = trace_statements(
+                    conn, lambda: find_symbol(conn, "create_user", limit=5)
+                )
+                self.assertGreaterEqual(count_selects(symbol_trace, "FROM nodes"), 1)
+
+                get_neighbors(conn, target["id"], limit=8)
+                neighbors_trace = trace_statements(
+                    conn, lambda: get_neighbors(conn, target["id"], limit=8)
+                )
+                self.assertGreaterEqual(count_selects(neighbors_trace, "FROM edges e"), 2)
+
+                build_context_pack(conn, "create user route", budget=2000, limit=5)
+                context_trace = trace_statements(
+                    conn,
+                    lambda: build_context_pack(conn, "create user route", budget=2000, limit=5),
+                )
+                self.assertGreaterEqual(count_selects(context_trace, "FROM node_fts"), 1)
 
     def test_neighbors_include_cross_file_callers_after_reindex(self) -> None:
         with (

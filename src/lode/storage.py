@@ -10,20 +10,10 @@ from .config import repo_id_for_root, sqlite_path
 from .model import Edge, FileIndex, Node
 
 
-class LodeConnection(sqlite3.Connection):
-    _lode_cache: dict[tuple[Any, ...], Any]
-    _lode_cache_order: list[tuple[Any, ...]]
-
-
-_QUERY_CACHE_MAX = 128
-
-
 def connect(path: Path | None = None) -> sqlite3.Connection:
     db_path = path or sqlite_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), factory=LodeConnection)
-    conn._lode_cache = {}
-    conn._lode_cache_order = []
+    conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -78,6 +68,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_nodes_repo_kind ON nodes(repo_id, kind);
         CREATE INDEX IF NOT EXISTS idx_nodes_repo_name ON nodes(repo_id, name);
         CREATE INDEX IF NOT EXISTS idx_nodes_repo_path ON nodes(repo_id, path);
+        CREATE INDEX IF NOT EXISTS idx_nodes_lower_name ON nodes(lower(name));
+        CREATE INDEX IF NOT EXISTS idx_nodes_lower_qname ON nodes(lower(qname));
 
         CREATE TABLE IF NOT EXISTS edges (
             repo_id TEXT NOT NULL,
@@ -388,60 +380,31 @@ def repo_filter(conn: sqlite3.Connection, repo_path: str | None) -> str | None:
     return repo_id if exists else None
 
 
-def fts_query(query: str) -> str:
+def fts_query(query: str, operator: str = "OR") -> str:
     import re
 
     tokens = re.findall(r"[A-Za-z0-9_./:-]+", query)
     if not tokens:
         return ""
-    return " OR ".join(tokens[:12])
+    separator = f" {operator} " if operator else " "
+    return separator.join(tokens[:12])
 
 
-def cache_lookup(conn: sqlite3.Connection, namespace: str, parts: tuple[Any, ...]) -> Any | None:
-    if not isinstance(conn, LodeConnection):
-        return None
-    data_version = conn.execute("PRAGMA data_version").fetchone()[0]
-    key = (namespace, conn.total_changes, data_version, *parts)
-    return conn._lode_cache.get(key)
-
-
-def cache_store(
-    conn: sqlite3.Connection, namespace: str, parts: tuple[Any, ...], value: Any
+def append_unique_nodes(
+    rows: Any,
+    results: list[dict[str, Any]],
+    seen_ids: set[str],
+    limit: int,
 ) -> None:
-    if not isinstance(conn, LodeConnection):
-        return
-    data_version = conn.execute("PRAGMA data_version").fetchone()[0]
-    key = (namespace, conn.total_changes, data_version, *parts)
-    if key not in conn._lode_cache:
-        conn._lode_cache_order.append(key)
-    conn._lode_cache[key] = value
-    while len(conn._lode_cache_order) > _QUERY_CACHE_MAX:
-        old_key = conn._lode_cache_order.pop(0)
-        conn._lode_cache.pop(old_key, None)
-
-
-def copy_node_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [dict(item) for item in items]
-
-
-def copy_neighbors(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "node": dict(payload["node"]) if payload.get("node") else None,
-        "outgoing": [
-            {
-                "edge": dict(item["edge"]),
-                "node": dict(item["node"]) if item.get("node") else None,
-            }
-            for item in payload.get("outgoing", [])
-        ],
-        "incoming": [
-            {
-                "edge": dict(item["edge"]),
-                "node": dict(item["node"]) if item.get("node") else None,
-            }
-            for item in payload.get("incoming", [])
-        ],
-    }
+    for row in rows:
+        node = row_to_node_dict(row)
+        node_id = str(node["id"])
+        if node_id in seen_ids:
+            continue
+        results.append(node)
+        seen_ids.add(node_id)
+        if len(results) >= limit:
+            break
 
 
 def search_nodes(
@@ -450,44 +413,109 @@ def search_nodes(
     repo_id: str | None = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    cache_parts = (query, repo_id, limit)
-    cached = cache_lookup(conn, "search_nodes", cache_parts)
-    if cached is not None:
-        return copy_node_dicts(cached)
-
-    fts = fts_query(query)
-    if fts:
+    strict_fts = fts_query(query, operator="")
+    broad_fts = fts_query(query)
+    if strict_fts:
+        results: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
         try:
             if repo_id:
-                rows = conn.execute(
-                    """
-                    SELECT n.*, bm25(node_fts) AS rank
-                    FROM node_fts
-                    JOIN nodes n ON n.id = node_fts.node_id
-                    WHERE node_fts MATCH ? AND n.repo_id = ?
-                    ORDER BY CASE WHEN n.kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END, rank
-                    LIMIT ?
-                    """,
-                    (fts, repo_id, limit),
-                )
-            else:
-                rows = conn.execute(
+                strict_rows = conn.execute(
                     """
                     SELECT n.*, bm25(node_fts) AS rank
                     FROM node_fts
                     JOIN nodes n ON n.id = node_fts.node_id
                     WHERE node_fts MATCH ?
-                    ORDER BY CASE WHEN n.kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END, rank
+                      AND n.repo_id = ?
+                      AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                    ORDER BY rank
                     LIMIT ?
                     """,
-                    (fts, limit),
+                    (strict_fts, repo_id, limit),
                 )
-            results = [row_to_node_dict(row) for row in rows]
-            if results:
-                cache_store(conn, "search_nodes", cache_parts, results)
-                return copy_node_dicts(results)
+            else:
+                strict_rows = conn.execute(
+                    """
+                    SELECT n.*, bm25(node_fts) AS rank
+                    FROM node_fts
+                    JOIN nodes n ON n.id = node_fts.node_id
+                    WHERE node_fts MATCH ?
+                      AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (strict_fts, limit),
+                )
+            append_unique_nodes(strict_rows, results, seen_ids, limit)
         except sqlite3.OperationalError:
             pass
+
+        if len(results) < limit and broad_fts and broad_fts != strict_fts:
+            try:
+                fill_limit = limit + len(results)
+                if repo_id:
+                    broad_rows = conn.execute(
+                        """
+                        SELECT n.*, 0.0 AS rank
+                        FROM node_fts
+                        JOIN nodes n ON n.id = node_fts.node_id
+                        WHERE node_fts MATCH ?
+                          AND n.repo_id = ?
+                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                        LIMIT ?
+                        """,
+                        (broad_fts, repo_id, fill_limit),
+                    )
+                else:
+                    broad_rows = conn.execute(
+                        """
+                        SELECT n.*, 0.0 AS rank
+                        FROM node_fts
+                        JOIN nodes n ON n.id = node_fts.node_id
+                        WHERE node_fts MATCH ?
+                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                        LIMIT ?
+                        """,
+                        (broad_fts, fill_limit),
+                    )
+                append_unique_nodes(broad_rows, results, seen_ids, limit)
+            except sqlite3.OperationalError:
+                pass
+
+        if len(results) < limit and broad_fts:
+            try:
+                fill_limit = limit - len(results)
+                if repo_id:
+                    external_rows = conn.execute(
+                        """
+                        SELECT n.*, 0.0 AS rank
+                        FROM node_fts
+                        JOIN nodes n ON n.id = node_fts.node_id
+                        WHERE node_fts MATCH ?
+                          AND n.repo_id = ?
+                          AND n.kind IN ('ExternalSymbol', 'ExternalDependency')
+                        LIMIT ?
+                        """,
+                        (broad_fts, repo_id, fill_limit),
+                    )
+                else:
+                    external_rows = conn.execute(
+                        """
+                        SELECT n.*, 0.0 AS rank
+                        FROM node_fts
+                        JOIN nodes n ON n.id = node_fts.node_id
+                        WHERE node_fts MATCH ?
+                          AND n.kind IN ('ExternalSymbol', 'ExternalDependency')
+                        LIMIT ?
+                        """,
+                        (broad_fts, fill_limit),
+                    )
+                append_unique_nodes(external_rows, results, seen_ids, limit)
+            except sqlite3.OperationalError:
+                pass
+
+        if results:
+            return results
 
     like = f"%{query}%"
     if repo_id:
@@ -517,8 +545,7 @@ def search_nodes(
             (like, like, like, like, query, limit),
         )
     results = [row_to_node_dict(row) for row in rows]
-    cache_store(conn, "search_nodes", cache_parts, results)
-    return copy_node_dicts(results)
+    return results
 
 
 def find_symbol(
@@ -527,41 +554,69 @@ def find_symbol(
     repo_id: str | None = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    cache_parts = (name, repo_id, limit)
-    cached = cache_lookup(conn, "find_symbol", cache_parts)
-    if cached is not None:
-        return copy_node_dicts(cached)
-
     lowered = name.lower()
     if repo_id:
-        rows = conn.execute(
+        exact_rows = conn.execute(
             """
             SELECT *, 0.0 AS rank FROM nodes
-            WHERE repo_id = ? AND (lower(name) = ? OR lower(qname) = ? OR lower(qname) LIKE ?)
+            WHERE repo_id = ? AND (lower(name) = ? OR lower(qname) = ?)
             ORDER BY
               CASE WHEN kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
               CASE WHEN lower(name) = ? THEN 0 ELSE 1 END,
               length(qname)
             LIMIT ?
             """,
-            [repo_id, lowered, lowered, f"%{lowered}%", lowered, limit],
+            [repo_id, lowered, lowered, lowered, limit],
         )
     else:
-        rows = conn.execute(
+        exact_rows = conn.execute(
             """
             SELECT *, 0.0 AS rank FROM nodes
-            WHERE lower(name) = ? OR lower(qname) = ? OR lower(qname) LIKE ?
+            WHERE lower(name) = ? OR lower(qname) = ?
             ORDER BY
               CASE WHEN kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
               CASE WHEN lower(name) = ? THEN 0 ELSE 1 END,
               length(qname)
             LIMIT ?
             """,
-            [lowered, lowered, f"%{lowered}%", lowered, limit],
+            [lowered, lowered, lowered, limit],
         )
-    results = [row_to_node_dict(row) for row in rows]
-    cache_store(conn, "find_symbol", cache_parts, results)
-    return copy_node_dicts(results)
+    results = [row_to_node_dict(row) for row in exact_rows]
+    if results:
+        return results
+
+    like = f"%{lowered}%"
+    if repo_id:
+        fallback_rows = conn.execute(
+            """
+            SELECT *, 0.0 AS rank FROM nodes
+            WHERE repo_id = ?
+              AND lower(qname) LIKE ?
+              AND lower(name) != ?
+              AND lower(qname) != ?
+            ORDER BY
+              CASE WHEN kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
+              length(qname)
+            LIMIT ?
+            """,
+            [repo_id, like, lowered, lowered, limit],
+        )
+    else:
+        fallback_rows = conn.execute(
+            """
+            SELECT *, 0.0 AS rank FROM nodes
+            WHERE lower(qname) LIKE ?
+              AND lower(name) != ?
+              AND lower(qname) != ?
+            ORDER BY
+              CASE WHEN kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
+              length(qname)
+            LIMIT ?
+            """,
+            [like, lowered, lowered, limit],
+        )
+    results.extend(row_to_node_dict(row) for row in fallback_rows)
+    return results
 
 
 def get_node(conn: sqlite3.Connection, node_id: str) -> dict[str, Any] | None:
@@ -569,17 +624,30 @@ def get_node(conn: sqlite3.Connection, node_id: str) -> dict[str, Any] | None:
     return row_to_node_dict(row) if row else None
 
 
-def get_neighbors(conn: sqlite3.Connection, node_id: str, limit: int = 80) -> dict[str, Any]:
-    cache_parts = (node_id, limit)
-    cached = cache_lookup(conn, "get_neighbors", cache_parts)
-    if cached is not None:
-        return copy_neighbors(cached)
+_NEIGHBOR_CONFIDENCE_ORDER = {"resolved": 0, "strong": 1}
 
+
+def neighbor_sort_key(item: dict[str, Any]) -> tuple[int, int, str, int]:
+    node = item.get("node") or {}
+    edge = item["edge"]
+    return (
+        1 if node.get("kind") in {"ExternalSymbol", "ExternalDependency"} else 0,
+        _NEIGHBOR_CONFIDENCE_ORDER.get(str(edge.get("confidence") or ""), 2),
+        str(node.get("path") or ""),
+        int(node.get("start_line") or 0),
+    )
+
+
+def sorted_neighbor_rows(rows: Any, limit: int) -> list[dict[str, Any]]:
+    neighbors = [neighbor_row_to_dict(row) for row in rows]
+    neighbors.sort(key=neighbor_sort_key)
+    return neighbors[:limit]
+
+
+def get_neighbors(conn: sqlite3.Connection, node_id: str, limit: int = 80) -> dict[str, Any]:
     node = get_node(conn, node_id)
     if not node:
-        payload: dict[str, Any] = {"node": None, "outgoing": [], "incoming": []}
-        cache_store(conn, "get_neighbors", cache_parts, payload)
-        return copy_neighbors(payload)
+        return {"node": None, "outgoing": [], "incoming": []}
     repo_id = str(node["repo_id"])
     outgoing_rows = conn.execute(
         """
@@ -587,14 +655,8 @@ def get_neighbors(conn: sqlite3.Connection, node_id: str, limit: int = 80) -> di
         FROM edges e
         LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.dst
         WHERE e.repo_id = ? AND e.src = ?
-        ORDER BY
-          CASE WHEN n.kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
-          CASE e.confidence WHEN 'resolved' THEN 0 WHEN 'strong' THEN 1 ELSE 2 END,
-          n.path,
-          n.start_line
-        LIMIT ?
         """,
-        (repo_id, node_id, limit),
+        (repo_id, node_id),
     )
     incoming_rows = conn.execute(
         """
@@ -602,22 +664,15 @@ def get_neighbors(conn: sqlite3.Connection, node_id: str, limit: int = 80) -> di
         FROM edges e
         LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.src
         WHERE e.repo_id = ? AND e.dst = ?
-        ORDER BY
-          CASE WHEN n.kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
-          CASE e.confidence WHEN 'resolved' THEN 0 WHEN 'strong' THEN 1 ELSE 2 END,
-          n.path,
-          n.start_line
-        LIMIT ?
         """,
-        (repo_id, node_id, limit),
+        (repo_id, node_id),
     )
     payload = {
         "node": node,
-        "outgoing": [neighbor_row_to_dict(row) for row in outgoing_rows],
-        "incoming": [neighbor_row_to_dict(row) for row in incoming_rows],
+        "outgoing": sorted_neighbor_rows(outgoing_rows, limit),
+        "incoming": sorted_neighbor_rows(incoming_rows, limit),
     }
-    cache_store(conn, "get_neighbors", cache_parts, payload)
-    return copy_neighbors(payload)
+    return payload
 
 
 def row_to_node_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -625,10 +680,13 @@ def row_to_node_dict(row: sqlite3.Row) -> dict[str, Any]:
         return {}
     data = dict(row)
     extra_json = data.pop("extra_json", "{}") or "{}"
-    try:
-        data["extra"] = json.loads(extra_json)
-    except json.JSONDecodeError:
+    if extra_json == "{}":
         data["extra"] = {}
+    else:
+        try:
+            data["extra"] = json.loads(extra_json)
+        except json.JSONDecodeError:
+            data["extra"] = {}
     return data
 
 
