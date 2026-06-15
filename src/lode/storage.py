@@ -37,6 +37,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             abspath TEXT NOT NULL,
             language TEXT NOT NULL,
             size INTEGER NOT NULL,
+            mtime REAL NOT NULL DEFAULT 0,
             content_hash TEXT NOT NULL,
             generated INTEGER NOT NULL DEFAULT 0,
             indexed_at REAL NOT NULL,
@@ -105,6 +106,11 @@ def init_db(conn: sqlite3.Connection) -> None:
         "tokenize='porter')"
     )
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE files ADD COLUMN mtime REAL NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
 
 
 def upsert_repo(conn: sqlite3.Connection, root: Path) -> str:
@@ -149,12 +155,13 @@ def replace_file_index(conn: sqlite3.Connection, repo_id: str, file_index: FileI
         )
         conn.execute(
             """
-            INSERT INTO files(repo_id, path, abspath, language, size, content_hash, generated, indexed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO files(repo_id, path, abspath, language, size, mtime, content_hash, generated, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(repo_id, path) DO UPDATE SET
               abspath=excluded.abspath,
               language=excluded.language,
               size=excluded.size,
+              mtime=excluded.mtime,
               content_hash=excluded.content_hash,
               generated=excluded.generated,
               indexed_at=excluded.indexed_at
@@ -165,6 +172,7 @@ def replace_file_index(conn: sqlite3.Connection, repo_id: str, file_index: FileI
                 file_index.abspath,
                 file_index.language,
                 file_index.size,
+                file_index.mtime,
                 file_index.content_hash,
                 1 if file_index.generated else 0,
                 now,

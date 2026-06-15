@@ -4,6 +4,7 @@ import ast
 import hashlib
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -80,30 +81,47 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
         repo_id = upsert_repo(conn, root)
         stats = IndexStats(repo_id=repo_id, root=str(root))
         live_paths: set[str] = set()
-        previous_hashes = {
-            row["path"]: row["content_hash"]
+        previous_files = {
+            row["path"]: {
+                "content_hash": row["content_hash"],
+                "size": row["size"],
+                "mtime": row["mtime"],
+            }
             for row in conn.execute(
-                "SELECT path, content_hash FROM files WHERE repo_id = ?", (repo_id,)
+                "SELECT path, content_hash, size, mtime FROM files WHERE repo_id = ?", (repo_id,)
             )
         }
         for path in iter_source_files(root):
             rel = path.relative_to(root).as_posix()
             live_paths.add(rel)
             stats.scanned += 1
-            digest = hash_file(path)
-            if previous_hashes.get(rel) == digest:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            prev = previous_files.get(rel)
+            if prev and prev["size"] == stat.st_size and prev["mtime"] == stat.st_mtime:
                 stats.skipped_unchanged += 1
                 continue
-            file_index = parse_file(root, path, digest)
+            digest = hash_file(path)
+            if prev and prev["content_hash"] == digest:
+                stats.skipped_unchanged += 1
+                conn.execute(
+                    "UPDATE files SET mtime = ?, indexed_at = ? WHERE repo_id = ? AND path = ?",
+                    (stat.st_mtime, time.time(), repo_id, rel),
+                )
+                continue
+            file_index = parse_file(root, path, digest, stat.st_mtime, stat.st_size)
             replace_file_index(conn, repo_id, file_index)
             stats.indexed += 1
             stats.nodes += len(file_index.nodes)
             stats.edges += len(file_index.edges)
         stats.removed = remove_missing_files(conn, repo_id, live_paths)
-        resolved = resolve_graph(conn, repo_id)
-        stats.resolved_imports = resolved.get("imports", 0)
-        stats.resolved_calls = resolved.get("calls", 0)
-        stats.resolved_extends = resolved.get("extends", 0)
+        if stats.indexed > 0 or stats.removed > 0:
+            resolved = resolve_graph(conn, repo_id)
+            stats.resolved_imports = resolved.get("imports", 0)
+            stats.resolved_calls = resolved.get("calls", 0)
+            stats.resolved_extends = resolved.get("extends", 0)
         return stats
     finally:
         conn.close()
@@ -142,7 +160,9 @@ def hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def parse_file(root: Path, path: Path, digest: str | None = None) -> FileIndex:
+def parse_file(
+    root: Path, path: Path, digest: str | None = None, mtime: float = 0.0, size: int | None = None
+) -> FileIndex:
     rel = path.relative_to(root).as_posix()
     language = SOURCE_EXTENSIONS.get(path.suffix.lower(), "text")
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -173,12 +193,13 @@ def parse_file(root: Path, path: Path, digest: str | None = None) -> FileIndex:
     edges.extend(extra_edges)
     if import_bindings:
         file_node.extra["imports"] = import_bindings
-    size = path.stat().st_size
+    file_size = size if size is not None else path.stat().st_size
     return FileIndex(
         path=rel,
         abspath=str(path),
         language=language,
-        size=size,
+        size=file_size,
+        mtime=mtime,
         content_hash=content_hash,
         generated=False,
         nodes=nodes,

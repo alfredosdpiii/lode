@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -120,6 +121,166 @@ class LodeIndexTests(unittest.TestCase):
                 self.assertNotEqual(target["id"], old_target_id)
                 neighbors = get_neighbors(conn, target["id"])
                 self.assert_has_resolved_caller(neighbors, "caller.call_target")
+
+    def test_hot_reindex_skips_all_unchanged(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+
+            cold = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreater(cold.scanned, 0)
+            self.assertGreater(cold.indexed, 0)
+            self.assertGreater(cold.nodes, 0)
+            self.assertGreater(cold.edges, 0)
+            self.assertEqual(cold.skipped_unchanged, 0)
+            self.assertEqual(cold.removed, 0)
+
+            hot = index_repo(repo, sqlite_path(data_dir))
+            self.assertEqual(hot.scanned, cold.scanned)
+            self.assertEqual(hot.skipped_unchanged, cold.scanned)
+            self.assertEqual(hot.indexed, 0)
+            self.assertEqual(hot.nodes, 0)
+            self.assertEqual(hot.edges, 0)
+            self.assertEqual(hot.removed, 0)
+
+    def test_reindex_skips_via_hash_fallback_when_mtime_changes(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+
+            cold = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreater(cold.indexed, 0)
+
+            app_py = repo / "app.py"
+            os.utime(app_py, (app_py.stat().st_atime + 1, app_py.stat().st_mtime + 1))
+
+            hot = index_repo(repo, sqlite_path(data_dir))
+            self.assertEqual(hot.indexed, 0)
+            self.assertEqual(hot.skipped_unchanged, cold.scanned)
+            self.assertEqual(hot.nodes, 0)
+            self.assertEqual(hot.edges, 0)
+            self.assertEqual(hot.removed, 0)
+
+    def test_reindex_after_file_change_updates_and_no_stale_nodes(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+
+            cold = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreater(cold.indexed, 0)
+
+            (repo / "app.py").write_text(
+                "def new_function():\n    return 42\n",
+                encoding="utf-8",
+            )
+
+            hot = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreater(hot.indexed, 0)
+            self.assertEqual(hot.removed, 0)
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                new_fn = find_symbol(conn, "new_function")
+                self.assertTrue(new_fn)
+                old_fn = find_symbol(conn, "create_user")
+                self.assertFalse(old_fn)
+                app_nodes = conn.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND owner_path = ?",
+                    (cold.repo_id, "app.py"),
+                ).fetchone()[0]
+                self.assertEqual(app_nodes, 2)
+                app_edges = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND owner_path = ?",
+                    (cold.repo_id, "app.py"),
+                ).fetchone()[0]
+                self.assertGreaterEqual(app_edges, 0)
+
+    def test_reindex_after_file_delete_removes_stale_data(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+
+            cold = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreater(cold.indexed, 0)
+
+            (repo / "app.py").unlink()
+
+            hot = index_repo(repo, sqlite_path(data_dir))
+            self.assertEqual(hot.indexed, 0)
+            self.assertGreater(hot.removed, 0)
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                nodes = conn.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND owner_path = ?",
+                    (cold.repo_id, "app.py"),
+                ).fetchone()[0]
+                self.assertEqual(nodes, 0)
+                edges = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND owner_path = ?",
+                    (cold.repo_id, "app.py"),
+                ).fetchone()[0]
+                self.assertEqual(edges, 0)
+                files = conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE repo_id = ? AND path = ?",
+                    (cold.repo_id, "app.py"),
+                ).fetchone()[0]
+                self.assertEqual(files, 0)
+                orphaned_edges = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM edges e
+                    LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.dst
+                    WHERE e.repo_id = ? AND n.id IS NULL
+                    """,
+                    (cold.repo_id,),
+                ).fetchone()[0]
+                self.assertEqual(orphaned_edges, 0)
+
+    def test_reindex_coverage_does_not_shrink(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+
+            cold = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreater(cold.indexed, 0)
+
+            hot = index_repo(repo, sqlite_path(data_dir))
+            self.assertEqual(hot.indexed, 0)
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                counts = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT f.path) AS files, COUNT(DISTINCT n.id) AS nodes,
+                           COUNT(DISTINCT e.rowid) AS edges
+                    FROM repos r
+                    LEFT JOIN files f ON f.repo_id = r.id
+                    LEFT JOIN nodes n ON n.repo_id = r.id
+                    LEFT JOIN edges e ON e.repo_id = r.id
+                    WHERE r.id = ?
+                    """,
+                    (cold.repo_id,),
+                ).fetchone()
+                self.assertGreaterEqual(counts["files"], 2)
+                self.assertGreaterEqual(counts["nodes"], 6)
+                self.assertGreaterEqual(counts["edges"], 5)
 
     def assert_has_resolved_caller(self, neighbors: dict[str, Any], caller_qname: str) -> None:
         incoming = neighbors["incoming"]
