@@ -178,14 +178,12 @@ def replace_file_index(conn: sqlite3.Connection, repo_id: str, file_index: FileI
                 now,
             ),
         )
-        for node in dedupe_nodes(file_index.nodes):
-            conn.execute(
-                """
-                INSERT INTO nodes(
-                    id, repo_id, owner_path, kind, name, qname, path, start_line, end_line,
-                    signature, doc, confidence, content_hash, extra_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+        deduped_nodes = dedupe_nodes(file_index.nodes)
+        node_values: list[tuple[Any, ...]] = []
+        fts_values: list[tuple[Any, ...]] = []
+        queue_values: list[tuple[Any, ...]] = []
+        for node in deduped_nodes:
+            node_values.append(
                 (
                     node.id,
                     repo_id,
@@ -201,48 +199,67 @@ def replace_file_index(conn: sqlite3.Connection, repo_id: str, file_index: FileI
                     node.confidence,
                     node.content_hash,
                     json.dumps(node.extra, sort_keys=True),
-                ),
+                )
             )
-            conn.execute(
-                "INSERT INTO node_fts(node_id, qname, name, signature, doc, path) VALUES (?, ?, ?, ?, ?, ?)",
-                (node.id, node.qname, node.name, node.signature, node.doc, node.path),
-            )
+            fts_values.append((node.id, node.qname, node.name, node.signature, node.doc, node.path))
             if (
                 node.kind in {"Function", "Method", "Class", "Route", "DocSection"}
                 and node.content_hash
             ):
-                conn.execute(
-                    """
-                    INSERT INTO embedding_queue(node_id, repo_id, content_hash, queued_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(node_id) DO UPDATE SET
-                      content_hash=excluded.content_hash,
-                      queued_at=CASE
-                        WHEN embedding_queue.content_hash != excluded.content_hash THEN excluded.queued_at
-                        ELSE embedding_queue.queued_at
-                      END,
-                      embedded_at=CASE
-                        WHEN embedding_queue.content_hash != excluded.content_hash THEN NULL
-                        ELSE embedding_queue.embedded_at
-                      END
-                    """,
-                    (node.id, repo_id, node.content_hash, now),
-                )
-        for edge in dedupe_edges(file_index.edges):
-            conn.execute(
+                queue_values.append((node.id, repo_id, node.content_hash, now))
+        if node_values:
+            conn.executemany(
+                """
+                INSERT INTO nodes(
+                    id, repo_id, owner_path, kind, name, qname, path, start_line, end_line,
+                    signature, doc, confidence, content_hash, extra_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                node_values,
+            )
+        if fts_values:
+            conn.executemany(
+                "INSERT INTO node_fts(node_id, qname, name, signature, doc, path) VALUES (?, ?, ?, ?, ?, ?)",
+                fts_values,
+            )
+        if queue_values:
+            conn.executemany(
+                """
+                INSERT INTO embedding_queue(node_id, repo_id, content_hash, queued_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                  content_hash=excluded.content_hash,
+                  queued_at=CASE
+                    WHEN embedding_queue.content_hash != excluded.content_hash THEN excluded.queued_at
+                    ELSE embedding_queue.queued_at
+                  END,
+                  embedded_at=CASE
+                    WHEN embedding_queue.content_hash != excluded.content_hash THEN NULL
+                    ELSE embedding_queue.embedded_at
+                  END
+                """,
+                queue_values,
+            )
+        deduped_edges = dedupe_edges(file_index.edges)
+        edge_values: list[tuple[Any, ...]] = [
+            (
+                repo_id,
+                file_index.path,
+                edge.src,
+                edge.dst,
+                edge.kind,
+                edge.confidence,
+                edge.detail,
+            )
+            for edge in deduped_edges
+        ]
+        if edge_values:
+            conn.executemany(
                 """
                 INSERT OR IGNORE INTO edges(repo_id, owner_path, src, dst, kind, confidence, detail)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    repo_id,
-                    file_index.path,
-                    edge.src,
-                    edge.dst,
-                    edge.kind,
-                    edge.confidence,
-                    edge.detail,
-                ),
+                edge_values,
             )
 
 

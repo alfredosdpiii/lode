@@ -25,6 +25,87 @@ from lode.storage import (
 
 
 class LodeIndexTests(unittest.TestCase):
+    def test_parse_file_with_explicit_text_matches_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "app.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+            from lode.indexer import parse_file
+
+            from_disk = parse_file(repo, repo / "app.py")
+            text = (repo / "app.py").read_text(encoding="utf-8")
+            from_text = parse_file(repo, repo / "app.py", text=text)
+            self.assertEqual(from_disk.content_hash, from_text.content_hash)
+            self.assertEqual(len(from_disk.nodes), len(from_text.nodes))
+            self.assertEqual(len(from_disk.edges), len(from_text.edges))
+            for a, b in zip(from_disk.nodes, from_text.nodes):
+                self.assertEqual(a.id, b.id)
+                self.assertEqual(a.content_hash, b.content_hash)
+
+    def test_batch_replace_preserves_nodes_edges_and_queue(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+            from lode.indexer import index_repo, parse_file
+            from lode.storage import connect, replace_file_index, sqlite_path
+
+            # First, do a normal index to get a repo_id
+            stats = index_repo(repo, sqlite_path(data_dir))
+            repo_id = stats.repo_id
+
+            # Now directly replace a file with batching
+            (repo / "app.py").write_text("def new_func():\n    return 42\n", encoding="utf-8")
+            file_index = parse_file(repo, repo / "app.py")
+            with connect(sqlite_path(data_dir)) as conn:
+                replace_file_index(conn, repo_id, file_index)
+
+                # Verify nodes are present with correct IDs and hashes
+                node_rows = list(
+                    conn.execute(
+                        "SELECT id, content_hash FROM nodes WHERE repo_id = ? AND owner_path = ?",
+                        (repo_id, "app.py"),
+                    )
+                )
+                self.assertEqual(len(node_rows), len(file_index.nodes))
+                for row in node_rows:
+                    self.assertTrue(any(row["id"] == n.id for n in file_index.nodes))
+
+                # Verify edges are present with correct details
+                edge_rows = list(
+                    conn.execute(
+                        "SELECT src, dst, kind, detail FROM edges WHERE repo_id = ? AND owner_path = ?",
+                        (repo_id, "app.py"),
+                    )
+                )
+                self.assertEqual(len(edge_rows), len(file_index.edges))
+
+                # Verify FTS rows are present
+                fts_rows = list(
+                    conn.execute(
+                        "SELECT node_id FROM node_fts WHERE node_id IN (SELECT id FROM nodes WHERE repo_id = ? AND owner_path = ?)",
+                        (repo_id, "app.py"),
+                    )
+                )
+                self.assertEqual(len(fts_rows), len(file_index.nodes))
+
+                # Verify embedding queue has expected rows
+                queue_rows = list(
+                    conn.execute(
+                        "SELECT node_id, content_hash FROM embedding_queue WHERE repo_id = ? AND node_id IN (SELECT id FROM nodes WHERE repo_id = ? AND owner_path = ?)",
+                        (repo_id, repo_id, "app.py"),
+                    )
+                )
+                expected_queue = [
+                    n
+                    for n in file_index.nodes
+                    if n.kind in {"Function", "Method", "Class", "Route", "DocSection"}
+                    and n.content_hash
+                ]
+                self.assertEqual(len(queue_rows), len(expected_queue))
+
     def test_indexes_python_symbols_routes_and_calls(self) -> None:
         with (
             tempfile.TemporaryDirectory() as repo_tmp,

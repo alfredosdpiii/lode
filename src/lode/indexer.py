@@ -103,7 +103,11 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
             if prev and prev["size"] == stat.st_size and prev["mtime"] == stat.st_mtime:
                 stats.skipped_unchanged += 1
                 continue
-            digest = hash_file(path)
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                continue
+            digest = hashlib.sha1(raw).hexdigest()
             if prev and prev["content_hash"] == digest:
                 stats.skipped_unchanged += 1
                 conn.execute(
@@ -111,7 +115,8 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
                     (stat.st_mtime, time.time(), repo_id, rel),
                 )
                 continue
-            file_index = parse_file(root, path, digest, stat.st_mtime, stat.st_size)
+            text = raw.decode("utf-8", errors="replace")
+            file_index = parse_file(root, path, digest, stat.st_mtime, stat.st_size, text)
             replace_file_index(conn, repo_id, file_index)
             stats.indexed += 1
             stats.nodes += len(file_index.nodes)
@@ -152,20 +157,18 @@ def is_probably_generated(path: Path) -> bool:
         return True
 
 
-def hash_file(path: Path) -> str:
-    h = hashlib.sha1()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def parse_file(
-    root: Path, path: Path, digest: str | None = None, mtime: float = 0.0, size: int | None = None
+    root: Path,
+    path: Path,
+    digest: str | None = None,
+    mtime: float = 0.0,
+    size: int | None = None,
+    text: str | None = None,
 ) -> FileIndex:
     rel = path.relative_to(root).as_posix()
     language = SOURCE_EXTENSIONS.get(path.suffix.lower(), "text")
-    text = path.read_text(encoding="utf-8", errors="replace")
+    if text is None:
+        text = path.read_text(encoding="utf-8", errors="replace")
     content_hash = digest or hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
     file_node = make_node(
         "File",
