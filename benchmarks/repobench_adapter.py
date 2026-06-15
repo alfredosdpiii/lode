@@ -8,7 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterator
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -123,13 +123,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="lode-repobench-") as temp_root:
         root = Path(temp_root)
-        for raw_index, (source, line_no, sample) in enumerate(iter_samples(input_path)):
+        sample_iter = iter_samples(input_path)
+        raw_index = -1
+        while True:
+            if args.limit is not None and global_evaluated >= args.limit:
+                break
+            try:
+                source, line_no, sample = next(sample_iter)
+                raw_index += 1
+            except StopIteration:
+                break
             if raw_index < args.start:
                 continue
             split_name = source.stem
             split_acc = split_accs[split_name]
-            if args.limit is not None and global_evaluated >= args.limit:
-                break
             sample_id = f"{source.name}:{line_no}"
 
             # Pre-classify bucket and level before materialization so skips
@@ -421,7 +428,7 @@ def _resolve_input_files(input_path: Path) -> list[Path]:
     return files
 
 
-def iter_samples(path: Path) -> Iterable[tuple[Path, int, dict[str, Any]]]:
+def iter_samples(path: Path) -> Iterator[tuple[Path, int, dict[str, Any]]]:
     files = sorted(path.glob("*.jsonl")) if path.is_dir() else [path]
     for file_path in files:
         with file_path.open("r", encoding="utf-8") as handle:

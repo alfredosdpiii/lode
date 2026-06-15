@@ -794,17 +794,17 @@ class BenchmarkScriptTests(unittest.TestCase):
         self.assertEqual(len(payload["details"]), 1)
 
     def test_repobench_adapter_stops_parsing_after_limit(self) -> None:
-        """When --limit is reached, the adapter stops iterating remaining rows."""
+        """When --limit is reached, the adapter stops before reading any post-cap row,
+        even malformed JSON in the same split file."""
         with tempfile.TemporaryDirectory() as data_tmp:
             root = Path(data_tmp)
             first = root / "cross_file_first.jsonl"
-            random = root / "cross_file_random.jsonl"
             manifest = root / "manifest.json"
             manifest.write_text(
                 json.dumps(
                     {
                         "dataset": "tianyang/repobench_python_v1.1",
-                        "jsonl_files": [str(first), str(random)],
+                        "jsonl_files": [str(first)],
                     }
                 ),
                 encoding="utf-8",
@@ -830,12 +830,8 @@ class BenchmarkScriptTests(unittest.TestCase):
                 "next_line": "    return service.save_user(name)",
                 "level": "2k",
             }
-            # First file has 2 valid samples
-            first.write_text(
-                json.dumps(sample) + "\n" + json.dumps(sample) + "\n", encoding="utf-8"
-            )
-            # Second file starts with invalid JSON that would cause a parse error if read
-            random.write_text("this is not valid json\n", encoding="utf-8")
+            # One valid sample, then malformed JSON immediately after the cap
+            first.write_text(json.dumps(sample) + "\nthis is not valid json\n", encoding="utf-8")
             result = subprocess.run(
                 [
                     sys.executable,
@@ -865,7 +861,7 @@ class BenchmarkScriptTests(unittest.TestCase):
                 timeout=120,
             )
         payload = json.loads(result.stdout)
-        # Must succeed because the adapter stops after limit=1 and never reads the second file
+        # Must succeed because the adapter stops before reading the malformed JSON
         self.assertTrue(payload["ok"], msg=result.stdout + result.stderr)
         self.assertEqual(payload["samples_evaluated"], 1)
 
