@@ -384,6 +384,60 @@ class BenchCompareOperationalTests(unittest.TestCase):
         finally:
             current_path.unlink(missing_ok=True)
 
+    def test_operational_fails_search_top_path_regression(self) -> None:
+        current = make_passing_operational_current()
+        current["search"]["embedding queue"]["top_path"] = "README.md"
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "operational", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("failed_metrics", payload)
+            self.assertIn("search.embedding queue.top_path", payload["failed_metrics"])
+            self.assertEqual(
+                payload["metrics"]["search.embedding queue.top_path"]["current"],
+                "README.md",
+            )
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_operational_fails_context_confidence_regression(self) -> None:
+        current = make_passing_operational_current()
+        current["context"]["build context pack"]["confidence"] = "exact"
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "operational", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            self.assertIn("failed_metrics", payload)
+            self.assertIn("context.build context pack.confidence", payload["failed_metrics"])
+            self.assertEqual(
+                payload["metrics"]["context.build context pack.confidence"]["current"],
+                "exact",
+            )
+        finally:
+            current_path.unlink(missing_ok=True)
+
 
 class BenchCompareEmbeddingTests(unittest.TestCase):
     def test_embedding_comparator_passes_better_metrics(self) -> None:
@@ -852,6 +906,29 @@ def load_baseline() -> dict:
     data = json.loads(path.read_text())
     assert isinstance(data, dict)
     return data
+
+
+def make_passing_operational_current() -> dict:
+    current = load_baseline()
+    current["parameters"] = OPERATIONAL_PARAMETERS
+    current["cold_index"]["timing_ms"] = 100.0
+    current["hot_index"]["timing_ms"] = 5.0
+    current["kuzu"]["timing_ms"] = 1000.0
+    for path in [
+        "search.build context pack.timing_ms",
+        "search.embedding queue.timing_ms",
+        "symbols.build_context_pack.timing_ms",
+        "context.build context pack.timing_ms",
+        "context.embedding queue.timing_ms",
+        "neighbors.timing_ms",
+    ]:
+        summary = get_nested(current, path)
+        if summary:
+            summary["p50"] = 0.1
+            summary["min"] = 0.05
+            summary["p95"] = 0.15
+            summary["max"] = 0.2
+    return current
 
 
 def load_repobench_baseline() -> dict:

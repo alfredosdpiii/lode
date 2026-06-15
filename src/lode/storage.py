@@ -390,6 +390,25 @@ def fts_query(query: str, operator: str = "OR") -> str:
     return separator.join(tokens[:12])
 
 
+def path_fts_query(query: str) -> str:
+    import re
+
+    tokens = re.findall(r"[A-Za-z0-9_./:-]+", query)
+    if len(tokens) < 3:
+        return ""
+    return " OR ".join(f"path: {token}" for token in tokens[:12])
+
+
+def column_fts_query(query: str) -> str:
+    import re
+
+    tokens = re.findall(r"[A-Za-z0-9_./:-]+", query)
+    if not tokens:
+        return ""
+    columns = ("name", "qname", "path")
+    return " OR ".join(f"{column}: {token}" for token in tokens[:12] for column in columns)
+
+
 def append_unique_nodes(
     rows: Any,
     results: list[dict[str, Any]],
@@ -407,6 +426,78 @@ def append_unique_nodes(
             break
 
 
+def search_path_priority(path: str) -> int:
+    if path.startswith("src/"):
+        return 0
+    if path.startswith(("scripts/", "benchmarks/")):
+        return 1
+    if path.startswith("tests/"):
+        return 2
+    if path in {"README.md", "AGENTS.md"} or path.startswith(("docs/", "skills/")):
+        return 3
+    return 1
+
+
+def search_kind_priority(kind: str) -> int:
+    if kind == "File":
+        return 0
+    if kind == "Class":
+        return 1
+    if kind in {"Function", "Method"}:
+        return 2
+    if kind == "Route":
+        return 3
+    if kind == "DocSection":
+        return 4
+    return 5
+
+
+def search_result_sort_key(node: dict[str, Any]) -> tuple[int, float, int, str, int, str]:
+    return (
+        search_path_priority(str(node.get("path") or "")),
+        float(node.get("rank") or 0.0),
+        search_kind_priority(str(node.get("kind") or "")),
+        str(node.get("path") or ""),
+        int(node.get("start_line") or 0),
+        str(node.get("qname") or ""),
+    )
+
+
+def unique_nodes_in_order(candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for node in candidates:
+        node_id = str(node["id"])
+        if node_id in seen_ids:
+            continue
+        results.append(node)
+        seen_ids.add(node_id)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def stable_search_results(candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    results = unique_nodes_in_order(candidates, limit)
+    if not results:
+        return results
+    top_priority = search_path_priority(str(results[0].get("path") or ""))
+    best_priority = min(search_path_priority(str(node.get("path") or "")) for node in candidates)
+    if best_priority < top_priority:
+        promoted = min(
+            (
+                node
+                for node in candidates
+                if search_path_priority(str(node.get("path") or "")) == best_priority
+            ),
+            key=search_result_sort_key,
+        )
+        promoted_id = str(promoted["id"])
+        remaining = [node for node in candidates if str(node["id"]) != promoted_id]
+        return [promoted, *unique_nodes_in_order(remaining, max(0, limit - 1))]
+    return results
+
+
 def search_nodes(
     conn: sqlite3.Connection,
     query: str,
@@ -415,46 +506,14 @@ def search_nodes(
 ) -> list[dict[str, Any]]:
     strict_fts = fts_query(query, operator="")
     broad_fts = fts_query(query)
-    if strict_fts:
-        results: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        try:
-            if repo_id:
-                strict_rows = conn.execute(
-                    """
-                    SELECT n.*, bm25(node_fts) AS rank
-                    FROM node_fts
-                    JOIN nodes n ON n.id = node_fts.node_id
-                    WHERE node_fts MATCH ?
-                      AND n.repo_id = ?
-                      AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                    ORDER BY rank
-                    LIMIT ?
-                    """,
-                    (strict_fts, repo_id, limit),
-                )
-            else:
-                strict_rows = conn.execute(
-                    """
-                    SELECT n.*, bm25(node_fts) AS rank
-                    FROM node_fts
-                    JOIN nodes n ON n.id = node_fts.node_id
-                    WHERE node_fts MATCH ?
-                      AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                    ORDER BY rank
-                    LIMIT ?
-                    """,
-                    (strict_fts, limit),
-                )
-            append_unique_nodes(strict_rows, results, seen_ids, limit)
-        except sqlite3.OperationalError:
-            pass
-
-        if len(results) < limit and broad_fts and broad_fts != strict_fts:
+    path_fts = path_fts_query(query)
+    column_fts = column_fts_query(query)
+    if strict_fts or broad_fts:
+        candidates: list[dict[str, Any]] = []
+        if path_fts:
             try:
-                fill_limit = limit + len(results)
                 if repo_id:
-                    broad_rows = conn.execute(
+                    path_rows = conn.execute(
                         """
                         SELECT n.*, 0.0 AS rank
                         FROM node_fts
@@ -464,10 +523,10 @@ def search_nodes(
                           AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
                         LIMIT ?
                         """,
-                        (broad_fts, repo_id, fill_limit),
+                        (path_fts, repo_id, limit),
                     )
                 else:
-                    broad_rows = conn.execute(
+                    path_rows = conn.execute(
                         """
                         SELECT n.*, 0.0 AS rank
                         FROM node_fts
@@ -476,24 +535,167 @@ def search_nodes(
                           AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
                         LIMIT ?
                         """,
-                        (broad_fts, fill_limit),
+                        (path_fts, limit),
                     )
-                append_unique_nodes(broad_rows, results, seen_ids, limit)
+                candidates.extend(row_to_node_dict(row) for row in path_rows)
             except sqlite3.OperationalError:
                 pass
 
-        if len(results) < limit and broad_fts:
+        if len(unique_nodes_in_order(candidates, limit)) < max(1, limit // 2):
+            candidates = []
+
+        if column_fts and not candidates:
             try:
+                if repo_id:
+                    column_rows = conn.execute(
+                        """
+                        SELECT n.*, 0.0 AS rank
+                        FROM node_fts
+                        JOIN nodes n ON n.id = node_fts.node_id
+                        WHERE node_fts MATCH ?
+                          AND n.repo_id = ?
+                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                        LIMIT ?
+                        """,
+                        (column_fts, repo_id, limit),
+                    )
+                else:
+                    column_rows = conn.execute(
+                        """
+                        SELECT n.*, 0.0 AS rank
+                        FROM node_fts
+                        JOIN nodes n ON n.id = node_fts.node_id
+                        WHERE node_fts MATCH ?
+                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                        LIMIT ?
+                        """,
+                        (column_fts, limit),
+                    )
+                column_candidates = [row_to_node_dict(row) for row in column_rows]
+                if len(unique_nodes_in_order(column_candidates, limit)) >= limit:
+                    candidates = column_candidates
+            except sqlite3.OperationalError:
+                pass
+
+        if strict_fts and not candidates:
+            try:
+                if repo_id:
+                    strict_rows = conn.execute(
+                        """
+                        SELECT n.*, bm25(node_fts) AS rank
+                        FROM node_fts
+                        JOIN nodes n ON n.id = node_fts.node_id
+                        WHERE node_fts MATCH ?
+                          AND n.repo_id = ?
+                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                        ORDER BY rank
+                        LIMIT ?
+                        """,
+                        (strict_fts, repo_id, limit),
+                    )
+                else:
+                    strict_rows = conn.execute(
+                        """
+                        SELECT n.*, bm25(node_fts) AS rank
+                        FROM node_fts
+                        JOIN nodes n ON n.id = node_fts.node_id
+                        WHERE node_fts MATCH ?
+                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                        ORDER BY rank
+                        LIMIT ?
+                        """,
+                        (strict_fts, limit),
+                    )
+                candidates.extend(row_to_node_dict(row) for row in strict_rows)
+            except sqlite3.OperationalError:
+                pass
+
+        if (
+            broad_fts
+            and broad_fts != strict_fts
+            and len(unique_nodes_in_order(candidates, limit)) < limit
+        ):
+            try:
+                current_count = len(unique_nodes_in_order(candidates, limit))
+                if current_count < max(1, limit // 2):
+                    fill_limit = limit
+                    if repo_id:
+                        column_rows = conn.execute(
+                            """
+                            SELECT n.*, 0.0 AS rank
+                            FROM node_fts
+                            JOIN nodes n ON n.id = node_fts.node_id
+                            WHERE node_fts MATCH ?
+                              AND n.repo_id = ?
+                              AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                            LIMIT ?
+                            """,
+                            (column_fts, repo_id, fill_limit),
+                        )
+                    else:
+                        column_rows = conn.execute(
+                            """
+                            SELECT n.*, 0.0 AS rank
+                            FROM node_fts
+                            JOIN nodes n ON n.id = node_fts.node_id
+                            WHERE node_fts MATCH ?
+                              AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                            LIMIT ?
+                            """,
+                            (column_fts, fill_limit),
+                        )
+                    candidates.extend(row_to_node_dict(row) for row in column_rows)
+                current_count = len(unique_nodes_in_order(candidates, limit))
+                if current_count < limit:
+                    if current_count >= max(1, limit // 2):
+                        fill_limit = max(1, limit - current_count + 2)
+                    else:
+                        fill_limit = limit
+                    if repo_id:
+                        broad_rows = conn.execute(
+                            """
+                            SELECT n.*, 0.0 AS rank
+                            FROM node_fts
+                            JOIN nodes n ON n.id = node_fts.node_id
+                            WHERE node_fts MATCH ?
+                              AND n.repo_id = ?
+                              AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                            LIMIT ?
+                            """,
+                            (broad_fts, repo_id, fill_limit),
+                        )
+                    else:
+                        broad_rows = conn.execute(
+                            """
+                            SELECT n.*, 0.0 AS rank
+                            FROM node_fts
+                            JOIN nodes n ON n.id = node_fts.node_id
+                            WHERE node_fts MATCH ?
+                              AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+                            LIMIT ?
+                            """,
+                            (broad_fts, fill_limit),
+                        )
+                    candidates.extend(row_to_node_dict(row) for row in broad_rows)
+            except sqlite3.OperationalError:
+                pass
+
+        results = stable_search_results(candidates, limit)
+
+        seen_ids = {str(node["id"]) for node in results}
+        try:
+            if len(results) < limit and broad_fts:
                 fill_limit = limit - len(results)
                 if repo_id:
                     external_rows = conn.execute(
                         """
-                        SELECT n.*, 0.0 AS rank
+                        SELECT n.*, bm25(node_fts) AS rank
                         FROM node_fts
                         JOIN nodes n ON n.id = node_fts.node_id
                         WHERE node_fts MATCH ?
                           AND n.repo_id = ?
                           AND n.kind IN ('ExternalSymbol', 'ExternalDependency')
+                        ORDER BY rank, n.path, n.start_line
                         LIMIT ?
                         """,
                         (broad_fts, repo_id, fill_limit),
@@ -501,18 +703,19 @@ def search_nodes(
                 else:
                     external_rows = conn.execute(
                         """
-                        SELECT n.*, 0.0 AS rank
+                        SELECT n.*, bm25(node_fts) AS rank
                         FROM node_fts
                         JOIN nodes n ON n.id = node_fts.node_id
                         WHERE node_fts MATCH ?
                           AND n.kind IN ('ExternalSymbol', 'ExternalDependency')
+                        ORDER BY rank, n.path, n.start_line
                         LIMIT ?
                         """,
                         (broad_fts, fill_limit),
                     )
                 append_unique_nodes(external_rows, results, seen_ids, limit)
-            except sqlite3.OperationalError:
-                pass
+        except sqlite3.OperationalError:
+            pass
 
         if results:
             return results

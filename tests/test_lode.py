@@ -279,6 +279,48 @@ class LodeIndexTests(unittest.TestCase):
                 )
                 self.assertGreaterEqual(count_selects(context_trace, "FROM node_fts"), 1)
 
+    def test_operational_search_and_context_preserve_source_ranking(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            source_dir = repo / "src" / "lode"
+            source_dir.mkdir(parents=True)
+            (source_dir / "embeddings.py").write_text(
+                "def embeddings_url():\n"
+                "    return 'http://127.0.0.1:7980'\n\n"
+                "def embeddings_model():\n"
+                "    return 'Snowflake/snowflake-arctic-embed-s'\n",
+                encoding="utf-8",
+            )
+            (source_dir / "context.py").write_text(
+                "def build_context_pack():\n"
+                '    """Build context pack for agents."""\n'
+                "    return []\n",
+                encoding="utf-8",
+            )
+            (repo / "README.md").write_text(
+                "# Architecture\n\n"
+                "The operational docs mention the embedding queue explicitly.\n\n"
+                "# Context\n\n"
+                "The docs also describe how to build context pack outputs.\n",
+                encoding="utf-8",
+            )
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                embedding_hits = search_nodes(conn, "embedding queue", limit=20)
+                self.assertTrue(embedding_hits)
+                self.assertEqual(embedding_hits[0]["path"], "src/lode/embeddings.py")
+
+                context = build_context_pack(conn, "build context pack", budget=4000, limit=10)
+                self.assertEqual(context["confidence"], "strong")
+                self.assertTrue(
+                    any(hit["path"] == "src/lode/context.py" for hit in context["top_hits"])
+                )
+
     def test_neighbors_include_cross_file_callers_after_reindex(self) -> None:
         with (
             tempfile.TemporaryDirectory() as repo_tmp,

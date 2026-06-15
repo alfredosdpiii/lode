@@ -227,7 +227,7 @@ def aggregate_confidence(hits: list[dict[str, Any]]) -> str:
         return "none"
     confidences = {hit.get("confidence") for hit in hits}
     if confidences <= {"exact"}:
-        return "exact"
+        return "exact" if len(hits) == 1 else "strong"
     if confidences <= {"exact", "strong"}:
         return "strong"
     return "mixed"
