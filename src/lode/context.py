@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from .storage import get_neighbors, repo_filter, search_nodes
+from .storage import repo_filter, search_nodes
 
 
 def build_context_pack(
@@ -34,14 +34,15 @@ def build_context_pack(
         remaining -= cost
 
     related = []
+    related_neighbors = compact_neighbors_for_hits(conn, hits[:5], limit=16)
     for hit in hits[:5]:
-        neighbors = get_neighbors(conn, hit["id"], limit=16)
+        neighbors = related_neighbors.get(hit["id"], {"incoming": [], "outgoing": []})
         related.append(
             {
                 "node_id": hit["id"],
                 "qname": hit["qname"],
-                "incoming": compact_neighbors(neighbors["incoming"]),
-                "outgoing": compact_neighbors(neighbors["outgoing"]),
+                "incoming": neighbors["incoming"],
+                "outgoing": neighbors["outgoing"],
             }
         )
 
@@ -103,6 +104,99 @@ def compact_neighbors(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def compact_neighbors_for_hits(
+    conn: sqlite3.Connection, hits: list[dict[str, Any]], limit: int
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    related: dict[str, dict[str, list[dict[str, Any]]]] = {
+        str(hit["id"]): {"incoming": [], "outgoing": []}
+        for hit in hits
+        if hit.get("id") and hit.get("repo_id")
+    }
+    if not related:
+        return related
+    ids_by_repo: dict[str, list[str]] = {}
+    for hit in hits:
+        node_id = str(hit.get("id") or "")
+        repo_id = str(hit.get("repo_id") or "")
+        if node_id and repo_id and node_id in related:
+            ids_by_repo.setdefault(repo_id, []).append(node_id)
+    for repo_id, node_ids in ids_by_repo.items():
+        unique_ids = list(dict.fromkeys(node_ids))
+        load_compact_neighbor_rows(conn, related, repo_id, unique_ids, "outgoing", limit)
+        load_compact_neighbor_rows(conn, related, repo_id, unique_ids, "incoming", limit)
+    return related
+
+
+def load_compact_neighbor_rows(
+    conn: sqlite3.Connection,
+    related: dict[str, dict[str, list[dict[str, Any]]]],
+    repo_id: str,
+    node_ids: list[str],
+    direction: str,
+    limit: int,
+) -> None:
+    if not node_ids:
+        return
+    placeholders = ",".join("?" for _ in node_ids)
+    if direction == "outgoing":
+        sql = f"""
+        SELECT e.src AS center_id,
+               e.kind AS edge_kind,
+               e.confidence AS edge_confidence,
+               n.kind AS node_kind,
+               n.qname AS node_qname,
+               n.path AS node_path,
+               n.start_line AS node_start_line
+        FROM edges e
+        LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.dst
+        WHERE e.repo_id = ? AND e.src IN ({placeholders})
+        ORDER BY
+          e.src,
+          CASE WHEN n.kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
+          CASE e.confidence WHEN 'resolved' THEN 0 WHEN 'strong' THEN 1 ELSE 2 END,
+          n.path,
+          n.start_line
+        """
+    else:
+        sql = f"""
+        SELECT e.dst AS center_id,
+               e.kind AS edge_kind,
+               e.confidence AS edge_confidence,
+               n.kind AS node_kind,
+               n.qname AS node_qname,
+               n.path AS node_path,
+               n.start_line AS node_start_line
+        FROM edges e
+        LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.src
+        WHERE e.repo_id = ? AND e.dst IN ({placeholders})
+        ORDER BY
+          e.dst,
+          CASE WHEN n.kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
+          CASE e.confidence WHEN 'resolved' THEN 0 WHEN 'strong' THEN 1 ELSE 2 END,
+          n.path,
+          n.start_line
+        """
+    rows = conn.execute(
+        sql,
+        [repo_id, *node_ids],
+    )
+    counts = {node_id: 0 for node_id in node_ids}
+    for row in rows:
+        center_id = str(row["center_id"])
+        if counts.get(center_id, 0) >= limit or row["node_qname"] is None:
+            continue
+        related[center_id][direction].append(
+            {
+                "edge": row["edge_kind"],
+                "qname": row["node_qname"],
+                "kind": row["node_kind"],
+                "path": row["node_path"],
+                "confidence": row["edge_confidence"],
+            }
+        )
+        counts[center_id] = counts.get(center_id, 0) + 1
 
 
 def reason_for_hit(node: dict[str, Any], query: str) -> str:

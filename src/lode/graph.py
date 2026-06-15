@@ -97,6 +97,15 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
         if row["kind"] == "Method" and "." in row["qname"]:
             class_qname = row["qname"].rsplit(".", 1)[0]
             methods_by_class.setdefault((row["path"], class_qname, row["name"]), []).append(row)
+    suffix_matches: dict[str, list[sqlite3.Row]] = {}
+    for row in def_rows:
+        parts = str(row["qname"]).split(".")
+        for index in range(1, len(parts)):
+            suffix_matches.setdefault("." + ".".join(parts[index:]), []).append(row)
+
+    import_aliases_by_path = {
+        path: build_import_aliases(bindings) for path, bindings in imports_by_path.items()
+    }
 
     module_cache: dict[tuple[str, str], str | None] = {}
 
@@ -123,33 +132,10 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
     def resolve_via_imports(
         caller_path: str, dotted: str, prefer: tuple[str, ...]
     ) -> sqlite3.Row | None:
-        bindings = imports_by_path.get(caller_path)
-        if not bindings:
+        alias_data = import_aliases_by_path.get(caller_path)
+        if not alias_data:
             return None
-        alias_map: dict[str, list[tuple[str, str | None]]] = {}
-        star_modules: list[str] = []
-
-        def add_alias(alias: str | None, module: str, name: str | None) -> None:
-            alias = (alias or "").strip()
-            if alias:
-                alias_map.setdefault(alias, []).append((module, name))
-
-        for binding in bindings:
-            module = str(binding.get("module") or "").strip()
-            if not module:
-                continue
-            raw_name = binding.get("name")
-            name = str(raw_name).strip() if raw_name is not None else None
-            if name == "*":
-                star_modules.append(module)
-                continue
-            alias = str(binding.get("alias") or "").strip()
-            if alias:
-                add_alias(alias, module, name)
-            elif name not in (None, "", "default"):
-                add_alias(name, module, name)
-            else:
-                add_alias(module, module, None)
+        alias_map, star_modules = alias_data
 
         segments = dotted.split(".")
         for index in range(len(segments), 0, -1):
@@ -237,7 +223,7 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
             return row
         if "." in dotted:
             suffix = "." + dotted
-            matches = [r for r in def_rows if r["qname"].endswith(suffix)]
+            matches = suffix_matches.get(suffix, [])
             if len(matches) == 1:
                 return matches[0]
         simple = dotted.rsplit(".", 1)[-1]
@@ -347,6 +333,36 @@ def resolve_graph(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
             )
             counts["extends"] += max(result.rowcount, 0)
     return counts
+
+
+def build_import_aliases(
+    bindings: list[dict[str, Any]],
+) -> tuple[dict[str, list[tuple[str, str | None]]], list[str]]:
+    alias_map: dict[str, list[tuple[str, str | None]]] = {}
+    star_modules: list[str] = []
+
+    def add_alias(alias: str | None, module: str, name: str | None) -> None:
+        alias = (alias or "").strip()
+        if alias:
+            alias_map.setdefault(alias, []).append((module, name))
+
+    for binding in bindings:
+        module = str(binding.get("module") or "").strip()
+        if not module:
+            continue
+        raw_name = binding.get("name")
+        name = str(raw_name).strip() if raw_name is not None else None
+        if name == "*":
+            star_modules.append(module)
+            continue
+        alias = str(binding.get("alias") or "").strip()
+        if alias:
+            add_alias(alias, module, name)
+        elif name not in (None, "", "default"):
+            add_alias(name, module, name)
+        else:
+            add_alias(module, module, None)
+    return alias_map, star_modules
 
 
 def join_module_name(module: str, name: str) -> str:

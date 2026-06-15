@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from lode.config import sqlite_path
-from lode.context import build_context_pack
-from lode.indexer import index_repo
+from lode.context import build_context_pack, compact_neighbors
+from lode.indexer import index_repo, iter_source_files
 from lode.storage import (
     connect,
     embedding_counts,
@@ -40,6 +40,19 @@ class LodeIndexTests(unittest.TestCase):
             for a, b in zip(from_disk.nodes, from_text.nodes):
                 self.assertEqual(a.id, b.id)
                 self.assertEqual(a.content_hash, b.content_hash)
+
+    def test_generated_artifact_directories_are_not_indexed(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "src").mkdir()
+            (repo / "src" / "app.py").write_text("def app():\n    return 1\n", encoding="utf-8")
+            (repo / "bench-results").mkdir()
+            (repo / "bench-results" / "run.json").write_text('{"ok": true}\n', encoding="utf-8")
+            (repo / "droid-wiki").mkdir()
+            (repo / "droid-wiki" / "overview.md").write_text("# Generated wiki\n", encoding="utf-8")
+
+            indexed = {path.relative_to(repo).as_posix() for path in iter_source_files(repo)}
+            self.assertEqual(indexed, {"src/app.py"})
 
     def test_batch_replace_preserves_nodes_edges_and_queue(self) -> None:
         with (
@@ -162,6 +175,49 @@ class LodeIndexTests(unittest.TestCase):
                 self.assertTrue(symbols)
                 self.assertEqual(symbols[0]["kind"], "Function")
                 self.assertEqual(symbols[0]["qname"], "nested.deep.module.long_symbol_name")
+
+    def test_find_symbol_case_insensitive_and_substring_fallback(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "context_tools.py").write_text(
+                "def Build_Context_Pack():\n    return 'ok'\n",
+                encoding="utf-8",
+            )
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                exact = find_symbol(conn, "build_context_pack", limit=5)
+                self.assertTrue(exact)
+                self.assertEqual(exact[0]["name"], "Build_Context_Pack")
+                self.assertEqual(exact[0]["kind"], "Function")
+
+                substring = find_symbol(conn, "context_pack", limit=5)
+                self.assertTrue(substring)
+                self.assertTrue(
+                    any(item["qname"] == "context_tools.Build_Context_Pack" for item in substring)
+                )
+
+    def test_context_related_matches_public_neighbor_compaction(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+            index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                context = build_context_pack(conn, "create user route", budget=2000, limit=5)
+                self.assertTrue(context["related"])
+                for related in context["related"]:
+                    neighbors = get_neighbors(conn, related["node_id"], limit=16)
+                    self.assertEqual(related["incoming"], compact_neighbors(neighbors["incoming"]))
+                    self.assertEqual(related["outgoing"], compact_neighbors(neighbors["outgoing"]))
 
     def test_neighbors_include_cross_file_callers_after_reindex(self) -> None:
         with (

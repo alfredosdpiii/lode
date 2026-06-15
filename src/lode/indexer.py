@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,8 @@ from .graph import resolve_graph
 from .model import Edge, FileIndex, Node
 from .storage import (
     connect,
-    remove_missing_files,
-    replace_file_index,
+    remove_missing_file_rows,
+    replace_file_indexes_rows,
     upsert_repo,
 )
 
@@ -35,6 +36,18 @@ SOURCE_EXTENSIONS = {
     ".toml": "toml",
 }
 
+AST_TRAVERSAL_LEAF_TYPES = (
+    ast.expr_context,
+    ast.operator,
+    ast.unaryop,
+    ast.cmpop,
+    ast.boolop,
+    ast.Constant,
+    ast.Name,
+    ast.arg,
+    ast.alias,
+)
+
 EXCLUDED_DIRS = {
     ".git",
     ".hg",
@@ -54,6 +67,8 @@ EXCLUDED_DIRS = {
     ".local-repo-kg",
     ".lode",
     ".kg",
+    "bench-results",
+    "droid-wiki",
 }
 
 
@@ -81,6 +96,8 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
         repo_id = upsert_repo(conn, root)
         stats = IndexStats(repo_id=repo_id, root=str(root))
         live_paths: set[str] = set()
+        changed_files: list[FileIndex] = []
+        skipped_updates: list[tuple[float, float, str, str]] = []
         previous_files = {
             row["path"]: {
                 "content_hash": row["content_hash"],
@@ -108,18 +125,22 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
             digest = hashlib.sha1(raw).hexdigest()
             if prev and prev["content_hash"] == digest:
                 stats.skipped_unchanged += 1
-                conn.execute(
-                    "UPDATE files SET mtime = ?, indexed_at = ? WHERE repo_id = ? AND path = ?",
-                    (stat.st_mtime, time.time(), repo_id, rel),
-                )
+                skipped_updates.append((stat.st_mtime, time.time(), repo_id, rel))
                 continue
             text = raw.decode("utf-8", errors="replace")
             file_index = parse_file(root, path, digest, stat.st_mtime, stat.st_size, text)
-            replace_file_index(conn, repo_id, file_index)
+            changed_files.append(file_index)
             stats.indexed += 1
             stats.nodes += len(file_index.nodes)
             stats.edges += len(file_index.edges)
-        stats.removed = remove_missing_files(conn, repo_id, live_paths)
+        with conn:
+            if skipped_updates:
+                conn.executemany(
+                    "UPDATE files SET mtime = ?, indexed_at = ? WHERE repo_id = ? AND path = ?",
+                    skipped_updates,
+                )
+            replace_file_indexes_rows(conn, repo_id, changed_files)
+            stats.removed = remove_missing_file_rows(conn, repo_id, live_paths)
         if stats.indexed > 0 or stats.removed > 0:
             resolved = resolve_graph(conn, repo_id)
             stats.resolved_imports = resolved.get("imports", 0)
@@ -295,10 +316,11 @@ def parse_python(
         )
         return [node], [Edge(file_node_id, node.id, "HAS_PARSE_ERROR", "exact")], []
 
+    lines = text.splitlines()
     symbol_by_name: dict[str, str] = {}
     for item in tree.body:
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            node = python_function_node(module, rel, item, text)
+            node = python_function_node(module, rel, item, lines)
             nodes.append(node)
             symbol_by_name[item.name] = node.id
             edges.append(Edge(file_node_id, node.id, "DEFINES", "exact"))
@@ -306,7 +328,7 @@ def parse_python(
             nodes.extend(route_nodes)
             edges.extend(route_edges)
         elif isinstance(item, ast.ClassDef):
-            class_node = python_class_node(module, rel, item, text)
+            class_node = python_class_node(module, rel, item, lines)
             nodes.append(class_node)
             symbol_by_name[item.name] = class_node.id
             edges.append(Edge(file_node_id, class_node.id, "DEFINES", "exact"))
@@ -327,7 +349,7 @@ def parse_python(
             for child in item.body:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     method = python_function_node(
-                        f"{module}.{item.name}", rel, child, text, kind="Method"
+                        f"{module}.{item.name}", rel, child, lines, kind="Method"
                     )
                     nodes.append(method)
                     edges.append(Edge(class_node.id, method.id, "CONTAINS", "exact"))
@@ -338,7 +360,8 @@ def parse_python(
                     nodes.extend(route_nodes)
                     edges.extend(route_edges)
 
-    for import_node in ast.walk(tree):
+    call_nodes: list[ast.Call] = []
+    for import_node in iter_imports_and_calls(tree):
         if isinstance(import_node, ast.Import):
             for alias in import_node.names:
                 import_module = alias.name
@@ -365,9 +388,11 @@ def parse_python(
                 dep = external_node("ExternalDependency", module, rel)
                 nodes.append(dep)
                 edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", module))
+        elif isinstance(import_node, ast.Call):
+            call_nodes.append(import_node)
 
     function_stack = build_python_function_ranges(nodes)
-    for call in [n for n in ast.walk(tree) if isinstance(n, ast.Call)]:
+    for call in call_nodes:
         call_name = dotted_name(call.func)
         if not call_name:
             continue
@@ -384,11 +409,25 @@ def parse_python(
     return nodes, edges, import_bindings
 
 
+def iter_imports_and_calls(tree: ast.AST) -> Iterator[ast.Import | ast.ImportFrom | ast.Call]:
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Call)):
+            yield node
+        children = [
+            child
+            for child in ast.iter_child_nodes(node)
+            if not isinstance(child, AST_TRAVERSAL_LEAF_TYPES)
+        ]
+        stack.extend(reversed(children))
+
+
 def python_function_node(
     prefix: str,
     rel: str,
     node: ast.FunctionDef | ast.AsyncFunctionDef,
-    text: str,
+    lines: list[str],
     kind: str = "Function",
 ) -> Node:
     args = [arg.arg for arg in node.args.args]
@@ -400,7 +439,7 @@ def python_function_node(
     start = getattr(node, "lineno", 1)
     end = getattr(node, "end_lineno", start)
     doc = ast.get_docstring(node) or ""
-    body = slice_lines(text, start, end)
+    body = slice_lines(lines, start, end)
     return make_node(
         kind,
         node.name,
@@ -415,14 +454,14 @@ def python_function_node(
     )
 
 
-def python_class_node(module: str, rel: str, node: ast.ClassDef, text: str) -> Node:
+def python_class_node(module: str, rel: str, node: ast.ClassDef, lines: list[str]) -> Node:
     start = getattr(node, "lineno", 1)
     end = getattr(node, "end_lineno", start)
     bases = [dotted_name(base) for base in node.bases]
     bases = [base for base in bases if base]
     signature = f"class {node.name}" + (f"({', '.join(bases)})" if bases else "")
     doc = ast.get_docstring(node) or ""
-    body = slice_lines(text, start, end)
+    body = slice_lines(lines, start, end)
     return make_node(
         "Class",
         node.name,
@@ -708,6 +747,5 @@ def external_node(kind: str, name: str, rel: str) -> Node:
     return make_node(kind, name, f"external:{name}", rel, 0, 0, name, confidence="heuristic")
 
 
-def slice_lines(text: str, start: int, end: int) -> str:
-    lines = text.splitlines()
+def slice_lines(lines: list[str], start: int, end: int) -> str:
     return "\n".join(lines[max(0, start - 1) : max(start, end)])
