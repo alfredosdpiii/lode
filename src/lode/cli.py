@@ -143,7 +143,10 @@ def cmd_index(args: argparse.Namespace) -> int:
     stats = index_repo(args.path, sqlite_path(args.data_dir))
     output: dict[str, Any] = {"ok": True, **asdict(stats)}
     if args.sync_kuzu:
-        output["kuzu"] = sync_kuzu(args)
+        kuzu = sync_kuzu(args)
+        output["kuzu"] = kuzu
+        output["nodes"] = kuzu["nodes"]
+        output["edges"] = kuzu["edges"]
     emit(output, args.json)
     return 0
 

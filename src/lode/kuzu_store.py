@@ -2,10 +2,28 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
+from csv import writer
 from pathlib import Path
 from typing import Any
 
 from .config import kuzu_path
+
+NODE_COLUMNS = [
+    "id",
+    "repo_id",
+    "kind",
+    "name",
+    "qname",
+    "path",
+    "start_line",
+    "end_line",
+    "signature",
+    "doc",
+    "confidence",
+    "extra_json",
+]
+EDGE_COLUMNS = ["src", "dst", "kind", "confidence", "detail", "repo_id"]
 
 
 def sync_from_sqlite(conn: sqlite3.Connection, path: Path | None = None) -> dict[str, Any]:
@@ -13,7 +31,8 @@ def sync_from_sqlite(conn: sqlite3.Connection, path: Path | None = None) -> dict
         import kuzu  # type: ignore[import-not-found]
     except ImportError as exc:
         raise RuntimeError(
-            "Kuzu is not installed. Install with `uv sync --extra kuzu` or use Docker."
+            "Kuzu is not installed. Install with `uv sync --extra kuzu` or "
+            "`pip install 'lode-kg[kuzu]'`."
         ) from exc
 
     db_path = path or kuzu_path()
@@ -22,49 +41,99 @@ def sync_from_sqlite(conn: sqlite3.Connection, path: Path | None = None) -> dict
     kconn = kuzu.Connection(database)
     reset_schema(kconn)
 
-    nodes = [dict(row) for row in conn.execute("SELECT * FROM nodes")]
-    edges = [dict(row) for row in conn.execute("SELECT * FROM edges")]
-    for node in nodes:
-        extra_json = node.get("extra_json") or "{}"
-        try:
-            extra = json.dumps(json.loads(extra_json), sort_keys=True)
-        except json.JSONDecodeError:
-            extra = "{}"
-        kconn.execute(
-            "CREATE (:Node {id: $id, repo_id: $repo_id, kind: $kind, name: $name, qname: $qname, path: $path, start_line: $start_line, end_line: $end_line, signature: $signature, doc: $doc, confidence: $confidence, extra_json: $extra_json})",
-            {
-                "id": node["id"],
-                "repo_id": node["repo_id"],
-                "kind": node["kind"],
-                "name": node["name"],
-                "qname": node["qname"],
-                "path": node["path"],
-                "start_line": node["start_line"],
-                "end_line": node["end_line"],
-                "signature": node.get("signature") or "",
-                "doc": node.get("doc") or "",
-                "confidence": node.get("confidence") or "unknown",
-                "extra_json": extra,
-            },
-        )
-    inserted_edges = 0
-    for edge in edges:
-        try:
+    with tempfile.TemporaryDirectory(prefix=".lode-kuzu-", dir=db_path.parent) as tmp:
+        tmp_path = Path(tmp)
+        nodes_csv = tmp_path / "nodes.csv"
+        edges_csv = tmp_path / "edges.csv"
+        node_count = write_nodes_csv(conn, nodes_csv)
+        edge_count = write_edges_csv(conn, edges_csv)
+        if node_count:
             kconn.execute(
-                "MATCH (s:Node {id: $src}), (d:Node {id: $dst}) CREATE (s)-[:LINK {kind: $kind, confidence: $confidence, detail: $detail, repo_id: $repo_id}]->(d)",
-                {
-                    "src": edge["src"],
-                    "dst": edge["dst"],
-                    "kind": edge["kind"],
-                    "confidence": edge["confidence"],
-                    "detail": edge.get("detail") or "",
-                    "repo_id": edge["repo_id"],
-                },
+                f"COPY Node FROM {kuzu_path_literal(nodes_csv)} (HEADER=true, PARALLEL=false)"  # nosec B608
             )
-            inserted_edges += 1
-        except RuntimeError:
-            continue
-    return {"kuzu_path": str(db_path), "nodes": len(nodes), "edges": inserted_edges}
+        if edge_count:
+            kconn.execute(
+                f"COPY LINK FROM {kuzu_path_literal(edges_csv)} (HEADER=true, PARALLEL=false)"  # nosec B608
+            )
+
+    projected_nodes = kuzu_count(kconn, "MATCH (n:Node) RETURN count(n)")
+    projected_edges = kuzu_count(kconn, "MATCH (:Node)-[e:LINK]->(:Node) RETURN count(e)")
+    if projected_nodes != node_count or projected_edges != edge_count:
+        raise RuntimeError(
+            "Kuzu projection count mismatch: "
+            f"SQLite nodes={node_count}, edges={edge_count}; "
+            f"Kuzu nodes={projected_nodes}, edges={projected_edges}."
+        )
+    return {"kuzu_path": str(db_path), "nodes": node_count, "edges": edge_count}
+
+
+def write_nodes_csv(conn: sqlite3.Connection, path: Path) -> int:
+    count = 0
+    columns = ", ".join(NODE_COLUMNS)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        csv_writer = writer(handle)
+        csv_writer.writerow(NODE_COLUMNS)
+        for node in conn.execute(f"SELECT {columns} FROM nodes ORDER BY id"):  # nosec B608
+            csv_writer.writerow(
+                [
+                    node["id"],
+                    node["repo_id"],
+                    node["kind"],
+                    node["name"],
+                    node["qname"],
+                    node["path"],
+                    node["start_line"],
+                    node["end_line"],
+                    node["signature"] or "",
+                    node["doc"] or "",
+                    node["confidence"] or "unknown",
+                    normalized_extra_json(node["extra_json"]),
+                ]
+            )
+            count += 1
+    return count
+
+
+def write_edges_csv(conn: sqlite3.Connection, path: Path) -> int:
+    count = 0
+    columns = ", ".join(EDGE_COLUMNS)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        csv_writer = writer(handle)
+        csv_writer.writerow(EDGE_COLUMNS)
+        for edge in conn.execute(
+            f"SELECT {columns} FROM edges ORDER BY repo_id, owner_path, src, dst, kind, detail"  # nosec B608
+        ):
+            csv_writer.writerow(
+                [
+                    edge["src"],
+                    edge["dst"],
+                    edge["kind"],
+                    edge["confidence"],
+                    edge["detail"] or "",
+                    edge["repo_id"],
+                ]
+            )
+            count += 1
+    return count
+
+
+def normalized_extra_json(raw: str | None) -> str:
+    try:
+        return json.dumps(json.loads(raw or "{}"), sort_keys=True)
+    except json.JSONDecodeError:
+        return "{}"
+
+
+def kuzu_path_literal(path: Path) -> str:
+    escaped = path.as_posix().replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
+def kuzu_count(kconn: Any, query: str) -> int:
+    result = kconn.execute(query)
+    if not result.has_next():
+        return 0
+    return int(result.get_next()[0])
 
 
 def reset_schema(kconn: Any) -> None:
