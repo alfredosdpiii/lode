@@ -156,7 +156,7 @@ def compare_operational(
                 "current": current_val,
                 "direction": spec["direction"],
                 "delta": None,
-                "pass": False,
+                "pass": False,  # nosec B105
                 "reason": "missing metric",
             }
             continue
@@ -169,7 +169,7 @@ def compare_operational(
                 "current": current_val,
                 "direction": spec["direction"],
                 "delta": None,
-                "pass": False,
+                "pass": False,  # nosec B105
                 "reason": "non-numeric metric",
             }
             continue
@@ -268,7 +268,7 @@ def compare_repobench(
                 "current": current_val,
                 "direction": spec["direction"],
                 "delta": None,
-                "pass": False,
+                "pass": False,  # nosec B105
                 "reason": "missing metric",
             }
             continue
@@ -281,7 +281,7 @@ def compare_repobench(
                 "current": current_val,
                 "direction": spec["direction"],
                 "delta": None,
-                "pass": False,
+                "pass": False,  # nosec B105
                 "reason": "non-numeric metric",
             }
             continue
@@ -333,7 +333,7 @@ def compare_repobench(
                     "current": current_val,
                     "direction": spec["direction"],
                     "delta": None,
-                    "pass": False,
+                    "pass": False,  # nosec B105
                     "reason": "missing metric",
                 }
                 continue
@@ -348,7 +348,7 @@ def compare_repobench(
                     "current": current_val,
                     "direction": spec["direction"],
                     "delta": None,
-                    "pass": False,
+                    "pass": False,  # nosec B105
                     "reason": "non-numeric metric",
                 }
                 continue
