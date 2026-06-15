@@ -22,6 +22,11 @@ SERVICE_CODE = """class UserService:
 """
 
 
+def write_sample_repo(repo: Path) -> None:
+    (repo / "app.py").write_text(APP_CODE, encoding="utf-8")
+    (repo / "services.py").write_text(SERVICE_CODE, encoding="utf-8")
+
+
 class BenchmarkScriptTests(unittest.TestCase):
     def test_operational_benchmark_outputs_json_metrics(self) -> None:
         with (
@@ -527,10 +532,266 @@ class BenchmarkScriptTests(unittest.TestCase):
         self.assertEqual(split["errors"][0]["sample_id"], "repobench.jsonl:1")
         self.assertEqual(split["errors"][0]["line"], 1)
 
+    def test_repobench_adapter_skip_accounted_in_bucket_and_level(self) -> None:
+        with tempfile.TemporaryDirectory() as data_tmp:
+            root = Path(data_tmp)
+            first = root / "cross_file_first.jsonl"
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "dataset": "tianyang/repobench_python_v1.1",
+                        "jsonl_files": [str(first)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            valid = {
+                "idx": 0,
+                "repo_name": "synthetic",
+                "file_path": "app.py",
+                "cropped_code": APP_CODE.rstrip("\n"),
+                "context": [
+                    {
+                        "identifier": "UserService",
+                        "path": "services.py",
+                        "snippet": SERVICE_CODE.rstrip("\n"),
+                    },
+                    {
+                        "identifier": "unrelated",
+                        "path": "other.py",
+                        "snippet": "def unrelated():\n    return None",
+                    },
+                ],
+                "gold_snippet_index": 0,
+                "next_line": "    return service.save_user(name)",
+                "level": "2k",
+            }
+            invalid = {
+                "idx": 1,
+                "repo_name": "synthetic",
+                "file_path": "app.py",
+                "cropped_code": APP_CODE.rstrip("\n"),
+                "context": [
+                    {
+                        "identifier": "UserService",
+                        "path": "services.py",
+                        "snippet": SERVICE_CODE.rstrip("\n"),
+                    },
+                ],
+                "gold_snippet_index": 5,
+                "next_line": "    return service.save_user(name)",
+                "level": "4k",
+            }
+            first.write_text(
+                json.dumps(valid) + "\n" + json.dumps(invalid) + "\n", encoding="utf-8"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "benchmarks/repobench_adapter.py",
+                    "--input",
+                    str(root),
+                    "--mode",
+                    "context",
+                    "--top-k",
+                    "1",
+                    "3",
+                    "5",
+                    "10",
+                    "--query-lines",
+                    "5",
+                    "--search-limit",
+                    "30",
+                    "--context-budget",
+                    "6000",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["samples_evaluated"], 1)
+        self.assertEqual(payload["samples_skipped"], 1)
+        split = payload["split_results"]["cross_file_first"]
+        self.assertEqual(split["samples_evaluated"], 1)
+        self.assertEqual(split["samples_skipped"], 1)
+        # Valid sample has 2 contexts -> lt5_candidates, level 2k
+        # Invalid sample has 1 context -> lt5_candidates, level 4k
+        by_bucket = split["by_bucket"]
+        self.assertEqual(by_bucket["lt5_candidates"]["samples_evaluated"], 1)
+        self.assertEqual(by_bucket["lt5_candidates"]["samples_skipped"], 1)
+        self.assertEqual(by_bucket["easy_5_9_candidates"]["samples_evaluated"], 0)
+        self.assertEqual(by_bucket["easy_5_9_candidates"]["samples_skipped"], 0)
+        self.assertEqual(by_bucket["hard_10_plus_candidates"]["samples_evaluated"], 0)
+        self.assertEqual(by_bucket["hard_10_plus_candidates"]["samples_skipped"], 0)
+        by_level = split["by_level"]
+        self.assertEqual(by_level["2k"]["samples_evaluated"], 1)
+        self.assertEqual(by_level["2k"]["samples_skipped"], 0)
+        self.assertEqual(by_level["4k"]["samples_evaluated"], 0)
+        self.assertEqual(by_level["4k"]["samples_skipped"], 1)
+        # Errors recorded at all levels
+        self.assertEqual(len(by_bucket["lt5_candidates"]["errors"]), 1)
+        self.assertEqual(len(by_level["4k"]["errors"]), 1)
 
-def write_sample_repo(repo: Path) -> None:
-    (repo / "app.py").write_text(APP_CODE, encoding="utf-8")
-    (repo / "services.py").write_text(SERVICE_CODE, encoding="utf-8")
+    def test_repobench_adapter_directory_limit_is_global(self) -> None:
+        with tempfile.TemporaryDirectory() as data_tmp:
+            root = Path(data_tmp)
+            first = root / "cross_file_first.jsonl"
+            random = root / "cross_file_random.jsonl"
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "dataset": "tianyang/repobench_python_v1.1",
+                        "jsonl_files": [str(first), str(random)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sample = {
+                "idx": 0,
+                "repo_name": "synthetic",
+                "file_path": "app.py",
+                "cropped_code": APP_CODE.rstrip("\n"),
+                "context": [
+                    {
+                        "identifier": "UserService",
+                        "path": "services.py",
+                        "snippet": SERVICE_CODE.rstrip("\n"),
+                    },
+                    {
+                        "identifier": "unrelated",
+                        "path": "other.py",
+                        "snippet": "def unrelated():\n    return None",
+                    },
+                ],
+                "gold_snippet_index": 0,
+                "next_line": "    return service.save_user(name)",
+                "level": "2k",
+            }
+            first.write_text(
+                json.dumps(sample) + "\n" + json.dumps(sample) + "\n", encoding="utf-8"
+            )
+            random.write_text(
+                json.dumps(sample) + "\n" + json.dumps(sample) + "\n", encoding="utf-8"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "benchmarks/repobench_adapter.py",
+                    "--input",
+                    str(root),
+                    "--mode",
+                    "context",
+                    "--top-k",
+                    "1",
+                    "3",
+                    "5",
+                    "10",
+                    "--query-lines",
+                    "5",
+                    "--search-limit",
+                    "30",
+                    "--context-budget",
+                    "6000",
+                    "--limit",
+                    "1",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["samples_evaluated"], 1)
+        # Only one split should have evaluated a sample; the other is skipped by global limit
+        total_evaluated = sum(s["samples_evaluated"] for s in payload["split_results"].values())
+        self.assertEqual(total_evaluated, 1)
+
+    def test_repobench_adapter_details_bounded_by_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as data_tmp:
+            root = Path(data_tmp)
+            first = root / "cross_file_first.jsonl"
+            random = root / "cross_file_random.jsonl"
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "dataset": "tianyang/repobench_python_v1.1",
+                        "jsonl_files": [str(first), str(random)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sample = {
+                "idx": 0,
+                "repo_name": "synthetic",
+                "file_path": "app.py",
+                "cropped_code": APP_CODE.rstrip("\n"),
+                "context": [
+                    {
+                        "identifier": "UserService",
+                        "path": "services.py",
+                        "snippet": SERVICE_CODE.rstrip("\n"),
+                    },
+                    {
+                        "identifier": "unrelated",
+                        "path": "other.py",
+                        "snippet": "def unrelated():\n    return None",
+                    },
+                ],
+                "gold_snippet_index": 0,
+                "next_line": "    return service.save_user(name)",
+                "level": "2k",
+            }
+            first.write_text(
+                json.dumps(sample) + "\n" + json.dumps(sample) + "\n", encoding="utf-8"
+            )
+            random.write_text(
+                json.dumps(sample) + "\n" + json.dumps(sample) + "\n", encoding="utf-8"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "benchmarks/repobench_adapter.py",
+                    "--input",
+                    str(root),
+                    "--mode",
+                    "context",
+                    "--top-k",
+                    "1",
+                    "3",
+                    "5",
+                    "10",
+                    "--query-lines",
+                    "5",
+                    "--search-limit",
+                    "30",
+                    "--context-budget",
+                    "6000",
+                    "--limit",
+                    "1",
+                    "--details",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["samples_evaluated"], 1)
+        self.assertEqual(len(payload["details"]), 1)
 
 
 if __name__ == "__main__":

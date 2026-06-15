@@ -119,6 +119,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
     details_rows: list[dict[str, Any]] = []
     all_errors: list[dict[str, Any]] = []
+    global_evaluated = 0
 
     with tempfile.TemporaryDirectory(prefix="lode-repobench-") as temp_root:
         root = Path(temp_root)
@@ -127,9 +128,28 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 continue
             split_name = source.stem
             split_acc = split_accs[split_name]
-            if args.limit is not None and split_acc.evaluated >= args.limit:
+            if args.limit is not None and global_evaluated >= args.limit:
                 continue
             sample_id = f"{source.name}:{line_no}"
+
+            # Pre-classify bucket and level before materialization so skips
+            # are still attributed to the correct bucket and level subtotals.
+            contexts = sample.get("context")
+            context_count = len(contexts) if isinstance(contexts, list) else 0
+            if context_count < 5:
+                bucket_name = "lt5_candidates"
+            elif context_count <= 9:
+                bucket_name = "easy_5_9_candidates"
+            else:
+                bucket_name = "hard_10_plus_candidates"
+            bucket_acc = split_buckets[split_name][bucket_name]
+
+            level = sample.get("level")
+            level_name = str(level) if isinstance(level, str) else "unknown"
+            if level_name not in split_levels[split_name]:
+                split_levels[split_name][level_name] = _make_acc(top_k)
+            level_acc = split_levels[split_name][level_name]
+
             try:
                 sample_root = root / f"sample-{split_name}-{split_acc.evaluated:06d}"
                 repo_dir = sample_root / "repo"
@@ -155,6 +175,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 rank = first_rank(ranked_paths, target_path)
                 split_acc.evaluated += 1
+                global_evaluated += 1
                 split_acc.index_timings.append(index_ms)
                 split_acc.retrieve_timings.append(retrieve_ms)
                 if rank is not None:
@@ -178,15 +199,6 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     )
 
                 # Bucket and level tracking
-                contexts = sample.get("context")
-                context_count = len(contexts) if isinstance(contexts, list) else 0
-                if context_count < 5:
-                    bucket_name = "lt5_candidates"
-                elif context_count <= 9:
-                    bucket_name = "easy_5_9_candidates"
-                else:
-                    bucket_name = "hard_10_plus_candidates"
-                bucket_acc = split_buckets[split_name][bucket_name]
                 bucket_acc.evaluated += 1
                 bucket_acc.index_timings.append(index_ms)
                 bucket_acc.retrieve_timings.append(retrieve_ms)
@@ -198,14 +210,6 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     bucket_acc.reciprocal_ranks.append(0.0)
 
-                level = sample.get("level")
-                if isinstance(level, str):
-                    level_name = level
-                else:
-                    level_name = "unknown"
-                if level_name not in split_levels[split_name]:
-                    split_levels[split_name][level_name] = _make_acc(top_k)
-                level_acc = split_levels[split_name][level_name]
                 level_acc.evaluated += 1
                 level_acc.index_timings.append(index_ms)
                 level_acc.retrieve_timings.append(retrieve_ms)
@@ -226,9 +230,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 sqlite3.Error,
             ) as exc:
                 split_acc.skipped += 1
+                bucket_acc.skipped += 1
+                level_acc.skipped += 1
                 error_obj = {"sample_id": sample_id, "error": str(exc), "line": line_no}
                 all_errors.append(error_obj)
                 split_acc.errors.append(error_obj)
+                bucket_acc.errors.append(error_obj)
+                level_acc.errors.append(error_obj)
                 if args.fail_fast:
                     raise ValueError(f"failed on {sample_id}: {exc}") from exc
             finally:
