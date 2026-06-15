@@ -47,6 +47,19 @@ class LodeHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self.ensure_request_id()
+        try:
+            self.handle_get()
+        except (
+            FileNotFoundError,
+            json.JSONDecodeError,
+            OSError,
+            sqlite3.Error,
+            TypeError,
+            ValueError,
+        ) as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+
+    def handle_get(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self.send_json({"ok": True, "service": "lode"})
@@ -62,7 +75,7 @@ class LodeHandler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query)
             query = first(params, "q") or first(params, "query") or ""
             repo = first(params, "repo")
-            limit = int(first(params, "limit") or 20)
+            limit = parse_query_int(params, "limit", 20)
             with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
                 repo_id = repo_filter(conn, repo)
                 self.send_json(
@@ -74,14 +87,13 @@ class LodeHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/impact":
             params = parse_qs(parsed.query)
-            target = first(params, "target") or first(params, "q") or ""
+            target = required_query(params, "target", "q")
             repo = first(params, "repo")
-            limit = int(first(params, "limit") or 5)
-            neighbor_limit = int(first(params, "neighbor_limit") or 200)
-            depth_param = first(params, "depth")
-            depth = int(depth_param) if depth_param else None
-            max_nodes = int(first(params, "max_nodes") or 1000)
-            direction = first(params, "direction") or "both"
+            limit = parse_query_int(params, "limit", 5)
+            neighbor_limit = parse_query_int(params, "neighbor_limit", 200)
+            depth = parse_optional_query_int(params, "depth")
+            max_nodes = parse_query_int(params, "max_nodes", 1000)
+            direction = parse_direction(first(params, "direction"))
             with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
                 repo_id = repo_filter(conn, repo)
                 targets = impact_targets(conn, target, repo_id, limit=limit)
@@ -117,7 +129,7 @@ class LodeHandler(BaseHTTPRequestHandler):
             if self.path == "/search":
                 query = str(required(body, "query"))
                 repo = body.get("repo")
-                limit = int(body.get("limit") or 20)
+                limit = parse_body_int(body, "limit", 20)
                 with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
                     repo_id = repo_filter(conn, repo)
                     self.send_json(
@@ -130,8 +142,8 @@ class LodeHandler(BaseHTTPRequestHandler):
             if self.path == "/context":
                 query = str(required(body, "query"))
                 repo = body.get("repo")
-                budget = int(body.get("budget") or 6000)
-                limit = int(body.get("limit") or 10)
+                budget = parse_body_int(body, "budget", 6000)
+                limit = parse_body_int(body, "limit", 10)
                 with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
                     self.send_json(
                         {
@@ -145,12 +157,11 @@ class LodeHandler(BaseHTTPRequestHandler):
             if self.path == "/impact":
                 target = str(required(body, "target"))
                 repo = body.get("repo")
-                limit = int(body.get("limit") or 5)
-                neighbor_limit = int(body.get("neighbor_limit") or 200)
-                depth_value = body.get("depth")
-                depth = int(str(depth_value)) if depth_value not in (None, "") else None
-                max_nodes = int(str(body.get("max_nodes") or 1000))
-                direction = body.get("direction") or "both"
+                limit = parse_body_int(body, "limit", 5)
+                neighbor_limit = parse_body_int(body, "neighbor_limit", 200)
+                depth = parse_optional_body_int(body, "depth")
+                max_nodes = parse_body_int(body, "max_nodes", 1000)
+                direction = parse_direction(body.get("direction"))
                 with closing(connect(sqlite_path(self.daemon_data_dir))) as conn:
                     repo_id = repo_filter(conn, repo)
                     targets = impact_targets(conn, target, repo_id, limit=limit)
@@ -238,6 +249,57 @@ class LodeHandler(BaseHTTPRequestHandler):
 def first(params: dict[str, list[str]], key: str) -> str | None:
     values = params.get(key)
     return values[0] if values else None
+
+
+def required_query(params: dict[str, list[str]], key: str, *aliases: str) -> str:
+    for name in (key, *aliases):
+        value = first(params, name)
+        if value is not None and value != "":
+            return value
+    names = " or ".join((key, *aliases))
+    raise ValueError(f"missing required query parameter: {names}")
+
+
+def parse_int_value(value: Any, name: str) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+def parse_query_int(params: dict[str, list[str]], key: str, default: int) -> int:
+    value = first(params, key)
+    if value in (None, ""):
+        return default
+    return parse_int_value(value, key)
+
+
+def parse_optional_query_int(params: dict[str, list[str]], key: str) -> int | None:
+    value = first(params, key)
+    if value in (None, ""):
+        return None
+    return parse_int_value(value, key)
+
+
+def parse_body_int(data: dict[str, Any], key: str, default: int) -> int:
+    value = data.get(key)
+    if value in (None, ""):
+        return default
+    return parse_int_value(value, key)
+
+
+def parse_optional_body_int(data: dict[str, Any], key: str) -> int | None:
+    value = data.get(key)
+    if value in (None, ""):
+        return None
+    return parse_int_value(value, key)
+
+
+def parse_direction(value: Any) -> str:
+    direction = "both" if value in (None, "") else str(value)
+    if direction not in {"up", "down", "both"}:
+        raise ValueError("direction must be 'up', 'down', or 'both'")
+    return direction
 
 
 def required(data: dict[str, Any], key: str) -> Any:

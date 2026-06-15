@@ -438,13 +438,15 @@ def edge_scope(edge_kind: str) -> str:
 
 
 def compact_radius_node(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    start_line = max(1, int(row["start_line"] or 0))
+    end_line = max(start_line, int(row["end_line"] or 0))
     return {
         "id": row["id"],
         "kind": row["kind"],
         "name": row["name"],
         "qname": row["qname"],
         "path": row["path"],
-        "lines": [row["start_line"], row["end_line"]],
+        "lines": [start_line, end_line],
     }
 
 

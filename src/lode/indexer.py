@@ -744,7 +744,7 @@ def parse_config(
 
 
 def external_node(kind: str, name: str, rel: str) -> Node:
-    return make_node(kind, name, f"external:{name}", rel, 0, 0, name, confidence="heuristic")
+    return make_node(kind, name, f"external:{name}", rel, 1, 1, name, confidence="heuristic")
 
 
 def slice_lines(lines: list[str], start: int, end: int) -> str:

@@ -913,6 +913,10 @@ def row_to_node_dict(row: sqlite3.Row) -> dict[str, Any]:
     if row is None:
         return {}
     data = dict(row)
+    start_line = int(data.get("start_line") or 0)
+    end_line = int(data.get("end_line") or 0)
+    data["start_line"] = max(1, start_line)
+    data["end_line"] = max(data["start_line"], end_line)
     extra_json = data.pop("extra_json", "{}") or "{}"
     if extra_json == "{}":
         data["extra"] = {}
