@@ -250,6 +250,90 @@ class LodeIndexTests(unittest.TestCase):
             self.assertEqual(hot.edges, 0)
             self.assertEqual(hot.removed, 0)
 
+    def test_reindex_same_length_different_content_with_preserved_mtime(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "app.py").write_text(
+                "def foo():\n    return 1\n",
+                encoding="utf-8",
+            )
+            cold = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreater(cold.indexed, 0)
+            self.assertGreater(cold.nodes, 0)
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                self.assertTrue(find_symbol(conn, "foo"))
+                old_nodes = conn.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND owner_path = ?",
+                    (cold.repo_id, "app.py"),
+                ).fetchone()[0]
+                self.assertGreater(old_nodes, 0)
+
+            # Rewrite with different content but same length, preserving mtime
+            original_mtime = (repo / "app.py").stat().st_mtime
+            (repo / "app.py").write_text(
+                "def bar():\n    return 2\n",
+                encoding="utf-8",
+            )
+            os.utime(repo / "app.py", (original_mtime, original_mtime))
+
+            hot = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreater(hot.indexed, 0)
+            self.assertGreater(hot.nodes, 0)
+            self.assertEqual(hot.removed, 0)
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                self.assertTrue(find_symbol(conn, "bar"))
+                self.assertFalse(find_symbol(conn, "foo"))
+                new_nodes = conn.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND owner_path = ?",
+                    (cold.repo_id, "app.py"),
+                ).fetchone()[0]
+                self.assertEqual(new_nodes, old_nodes)
+
+    def test_reindex_unreadable_file_removes_stale_data(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            (repo / "app.py").write_text(
+                "def foo():\n    return 1\n",
+                encoding="utf-8",
+            )
+            cold = index_repo(repo, sqlite_path(data_dir))
+            self.assertGreater(cold.indexed, 0)
+
+            (repo / "app.py").chmod(0o000)
+            try:
+                hot = index_repo(repo, sqlite_path(data_dir))
+                self.assertEqual(hot.indexed, 0)
+                self.assertGreater(hot.removed, 0)
+
+                with closing(connect(sqlite_path(data_dir))) as conn:
+                    nodes = conn.execute(
+                        "SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND owner_path = ?",
+                        (cold.repo_id, "app.py"),
+                    ).fetchone()[0]
+                    self.assertEqual(nodes, 0)
+                    edges = conn.execute(
+                        "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND owner_path = ?",
+                        (cold.repo_id, "app.py"),
+                    ).fetchone()[0]
+                    self.assertEqual(edges, 0)
+                    files = conn.execute(
+                        "SELECT COUNT(*) FROM files WHERE repo_id = ? AND path = ?",
+                        (cold.repo_id, "app.py"),
+                    ).fetchone()[0]
+                    self.assertEqual(files, 0)
+            finally:
+                (repo / "app.py").chmod(0o644)
+
     def test_reindex_after_file_change_updates_and_no_stale_nodes(self) -> None:
         with (
             tempfile.TemporaryDirectory() as repo_tmp,

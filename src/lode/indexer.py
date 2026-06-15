@@ -93,19 +93,17 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
         }
         for path in iter_source_files(root):
             rel = path.relative_to(root).as_posix()
-            live_paths.add(rel)
             stats.scanned += 1
             try:
                 stat = path.stat()
             except OSError:
                 continue
+            live_paths.add(rel)
             prev = previous_files.get(rel)
-            if prev and prev["size"] == stat.st_size and prev["mtime"] == stat.st_mtime:
-                stats.skipped_unchanged += 1
-                continue
             try:
                 raw = path.read_bytes()
             except OSError:
+                live_paths.discard(rel)
                 continue
             digest = hashlib.sha1(raw).hexdigest()
             if prev and prev["content_hash"] == digest:
