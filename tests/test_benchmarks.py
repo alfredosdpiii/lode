@@ -60,6 +60,264 @@ class BenchmarkScriptTests(unittest.TestCase):
         self.assertIn("create user", payload["search"])
         self.assertIn("create_user", payload["symbols"])
 
+    def test_operational_benchmark_output_file_matches_stdout(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+            tempfile.TemporaryDirectory() as out_tmp,
+        ):
+            repo = Path(repo_tmp)
+            write_sample_repo(repo)
+            output_file = Path(out_tmp) / "output.json"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/bench_lode.py",
+                    "--repo",
+                    str(repo),
+                    "--data-dir",
+                    data_tmp,
+                    "--reset",
+                    "--repeat",
+                    "2",
+                    "--query",
+                    "create user",
+                    "--symbol",
+                    "create_user",
+                    "--json",
+                    "--output",
+                    str(output_file),
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+            stdout_payload = json.loads(result.stdout)
+            self.assertTrue(output_file.exists())
+            file_payload = json.loads(output_file.read_text())
+            self.assertEqual(file_payload["ok"], stdout_payload["ok"])
+            self.assertEqual(file_payload["repo"], stdout_payload["repo"])
+            self.assertEqual(file_payload["cold_index"], stdout_payload["cold_index"])
+            self.assertEqual(file_payload["hot_index"], stdout_payload["hot_index"])
+            self.assertEqual(file_payload["database"], stdout_payload["database"])
+
+    def test_operational_benchmark_data_dir_explicit(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            write_sample_repo(repo)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/bench_lode.py",
+                    "--repo",
+                    str(repo),
+                    "--data-dir",
+                    data_tmp,
+                    "--reset",
+                    "--repeat",
+                    "2",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(Path(payload["data_dir"]).resolve(), Path(data_tmp).resolve())
+            # Ensure data directory was actually used
+            self.assertTrue((Path(data_tmp) / "lode.sqlite").exists())
+
+    def test_operational_benchmark_temp_data_dir_cleaned(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            write_sample_repo(repo)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/bench_lode.py",
+                    "--repo",
+                    str(repo),
+                    "--repeat",
+                    "2",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        data_dir = Path(payload["data_dir"])
+        # Temp dir should be cleaned up by default
+        self.assertFalse(data_dir.exists())
+
+    def test_operational_benchmark_invalid_repo_machine_readable(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/bench_lode.py",
+                "--repo",
+                "/tmp/does_not_exist_12345",
+                "--json",
+            ],
+            capture_output=True,
+            cwd=PROJECT_ROOT,
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("error", payload)
+        self.assertTrue(len(payload["error"]) > 0)
+        self.assertIn("does not exist", payload["error"].lower())
+        # No traceback in stdout or stderr
+        self.assertNotIn("Traceback", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_operational_benchmark_timing_summary_complete(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            write_sample_repo(repo)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/bench_lode.py",
+                    "--repo",
+                    str(repo),
+                    "--data-dir",
+                    data_tmp,
+                    "--reset",
+                    "--repeat",
+                    "3",
+                    "--query",
+                    "create user",
+                    "--symbol",
+                    "create_user",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        # Check all timing summaries have required fields and ordering
+        for section, key in [
+            ("search", "create user"),
+            ("symbols", "create_user"),
+            ("context", "create user"),
+        ]:
+            summary = payload[section][key]["timing_ms"]
+            required_keys = ["count", "min", "p50", "mean", "p95", "max"]
+            for rk in required_keys:
+                self.assertIn(rk, summary, f"{section}.{key}.timing_ms missing {rk}")
+                self.assertIsInstance(
+                    summary[rk], (int, float), f"{section}.{key}.timing_ms.{rk} is not numeric"
+                )
+            self.assertEqual(summary["count"], 3)
+            self.assertTrue(
+                0 <= summary["min"] <= summary["p50"] <= summary["p95"] <= summary["max"],
+                f"{section}.{key} timing order violation: {summary}",
+            )
+
+    def test_operational_benchmark_json_shape(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            write_sample_repo(repo)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/bench_lode.py",
+                    "--repo",
+                    str(repo),
+                    "--data-dir",
+                    data_tmp,
+                    "--reset",
+                    "--repeat",
+                    "2",
+                    "--query",
+                    "create user",
+                    "--symbol",
+                    "create_user",
+                    "--include-kuzu",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=PROJECT_ROOT,
+                text=True,
+                timeout=120,
+            )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        # Required top-level keys
+        for key in [
+            "ok",
+            "repo",
+            "data_dir",
+            "cold_index",
+            "hot_index",
+            "database",
+            "search",
+            "symbols",
+            "context",
+            "neighbors",
+            "kuzu",
+        ]:
+            self.assertIn(key, payload)
+        # Cold index stats
+        cold_stats = payload["cold_index"]["stats"]
+        self.assertGreater(cold_stats["scanned"], 0)
+        self.assertGreater(cold_stats["indexed"], 0)
+        self.assertGreater(cold_stats["nodes"], 0)
+        self.assertGreater(cold_stats["edges"], 0)
+        self.assertEqual(cold_stats["removed"], 0)
+        self.assertEqual(cold_stats["skipped_unchanged"], 0)
+        # Hot index stats
+        hot_stats = payload["hot_index"]["stats"]
+        self.assertEqual(hot_stats["scanned"], cold_stats["scanned"])
+        self.assertEqual(hot_stats["skipped_unchanged"], cold_stats["scanned"])
+        self.assertEqual(hot_stats["indexed"], 0)
+        self.assertEqual(hot_stats["nodes"], 0)
+        self.assertEqual(hot_stats["edges"], 0)
+        self.assertEqual(hot_stats["removed"], 0)
+        # Database counts
+        counts = payload["database"]["counts"]
+        self.assertEqual(counts["repos"], 1)
+        self.assertGreater(counts["files"], 0)
+        self.assertGreater(counts["nodes"], 0)
+        self.assertGreater(counts["edges"], 0)
+        self.assertGreater(payload["database"]["sqlite_bytes"], 0)
+        # Kuzu
+        kuzu = payload["kuzu"]
+        self.assertGreater(kuzu["timing_ms"], 0)
+        self.assertEqual(kuzu["nodes"], counts["nodes"])
+        self.assertEqual(kuzu["edges"], counts["edges"])
+        # Neighbors
+        neighbors = payload["neighbors"]
+        self.assertIn("node_id", neighbors)
+        self.assertIn("timing_ms", neighbors)
+        self.assertTrue(neighbors["incoming"] + neighbors["outgoing"] > 0)
+
     def test_repobench_adapter_scores_synthetic_sample(self) -> None:
         with tempfile.TemporaryDirectory() as data_tmp:
             input_path = Path(data_tmp) / "repobench.jsonl"
