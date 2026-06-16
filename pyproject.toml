@@ -1,6 +1,6 @@
 [project]
 name = "lode-kg"
-version = "0.1.2"
+version = "0.1.3"
 description = "Lode: fully local repository knowledge graph daemon and CLI."
 readme = "README.md"
 requires-python = ">=3.11"
