@@ -52,29 +52,45 @@ Or install with the optional embedded Kuzu projection support:
 uv tool install 'lode-kg[kuzu]'
 ```
 
-### Install the Pi skill
+### Install the agent skill
 
-This repo also ships a Pi skill at `skills/lode/`. The skill is not the CLI; it
-is the short instruction pack that tells Pi when to reach for `lode index`,
-`lode search`, `lode symbol`, `lode context`, and `lode impact` during codebase
-work.
+This repo also ships a reusable coding-agent skill at `skills/lode/`. The skill
+is not the CLI; it is the short instruction pack that tells an agent when to
+reach for `lode index`, `lode search`, `lode symbol`, `lode context`, and
+`lode impact` during codebase work.
 
-Install it globally for your Pi user:
+Install it into any coding agent that supports skill or instruction-pack
+directories:
 
 ```bash
-mkdir -p ~/.pi/agent/skills/lode
-cp -R skills/lode/. ~/.pi/agent/skills/lode/
+AGENT_SKILLS_DIR="/path/to/your/agent/skills"
+mkdir -p "$AGENT_SKILLS_DIR/lode"
+cp -R skills/lode/. "$AGENT_SKILLS_DIR/lode/"
 ```
 
-Or install it only for one project:
+Common destinations include:
+
+```bash
+# Factory Droid
+AGENT_SKILLS_DIR="$HOME/.factory/skills"
+
+# Pi
+AGENT_SKILLS_DIR="$HOME/.pi/agent/skills"
+
+# Project-local agents
+AGENT_SKILLS_DIR="$PWD/.agents/skills"
+```
+
+Or install it only for this project:
 
 ```bash
 mkdir -p .agents/skills/lode
 cp -R skills/lode/. .agents/skills/lode/
 ```
 
-Then run `/reload` inside Pi, or restart Pi. You can force-load it with
-`/skill:lode`; otherwise Pi should pick it up when a task calls for local repo
+Then reload or restart your agent so its skill registry picks up the new
+directory. Agents with explicit skill commands may also let you force-load it as
+`lode`; otherwise the agent should pick it up when a task calls for local repo
 search, symbol lookup, impact checks, graph neighbors, or a bounded context pack.
 
 Review `skills/lode/SKILL.md` before installing it from any checkout you do not
