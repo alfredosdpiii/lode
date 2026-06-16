@@ -441,21 +441,36 @@ def list_repos(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 def repo_filter(conn: sqlite3.Connection, repo_path: str | None) -> str | None:
     if not repo_path:
         return None
-    if not _is_safe_repo_path_input(repo_path):
+    root = _normalize_repo_path_input(repo_path)
+    if root is None:
         return None
-    root = Path(repo_path).expanduser().resolve()
-    repo_id = repo_id_for_root(root)
-    exists = conn.execute("SELECT 1 FROM repos WHERE id = ?", (repo_id,)).fetchone()
-    return repo_id if exists else None
+    row = conn.execute("SELECT id FROM repos WHERE root = ?", (root,)).fetchone()
+    return str(row[0]) if row else None
 
 
-def _is_safe_repo_path_input(repo_path: str) -> bool:
-    if not repo_path or len(repo_path) > 4096:
+def _normalize_repo_path_input(repo_path: str) -> str | None:
+    stripped = repo_path.strip()
+    if not _is_safe_repo_path_input(stripped):
+        return None
+    if stripped == "~":
+        return str(Path.home())
+    if stripped.startswith("~/"):
+        stripped = f"{Path.home()}{stripped[1:]}"
+    return stripped.rstrip("/") if len(stripped) > 1 else stripped
+
+
+def _is_safe_repo_path_input(stripped_repo_path: str) -> bool:
+    if not stripped_repo_path or len(stripped_repo_path) > 4096:
         return False
-    if "\x00" in repo_path or not _REPO_PATH_RE.fullmatch(repo_path):
+    if "\x00" in stripped_repo_path or not _REPO_PATH_RE.fullmatch(stripped_repo_path):
         return False
-    path = Path(repo_path)
-    return not any(part == ".." for part in path.parts)
+    if not (
+        stripped_repo_path.startswith("/")
+        or stripped_repo_path == "~"
+        or stripped_repo_path.startswith("~/")
+    ):
+        return False
+    return not any(part == ".." for part in stripped_repo_path.split("/"))
 
 
 def fts_query(query: str, operator: str = "OR") -> str:

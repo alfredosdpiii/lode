@@ -162,7 +162,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_search(args: argparse.Namespace) -> int:
     with closing(connect(sqlite_path(args.data_dir))) as conn:
-        repo_id = repo_filter(conn, args.repo)
+        repo_id = repo_filter(conn, normalize_repo_arg(args.repo))
         output = {
             "ok": True,
             "results": search_nodes(conn, args.query, repo_id=repo_id, limit=args.limit),
@@ -173,7 +173,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_symbol(args: argparse.Namespace) -> int:
     with closing(connect(sqlite_path(args.data_dir))) as conn:
-        repo_id = repo_filter(conn, args.repo)
+        repo_id = repo_filter(conn, normalize_repo_arg(args.repo))
         output = {
             "ok": True,
             "results": find_symbol(conn, args.name, repo_id=repo_id, limit=args.limit),
@@ -184,12 +184,13 @@ def cmd_symbol(args: argparse.Namespace) -> int:
 
 def cmd_context(args: argparse.Namespace) -> int:
     with closing(connect(sqlite_path(args.data_dir))) as conn:
+        repo_path = normalize_repo_arg(args.repo)
         output = {
             "ok": True,
             **build_context_pack(
                 conn,
                 args.query,
-                repo_path=args.repo,
+                repo_path=repo_path,
                 budget=args.budget,
                 limit=args.limit,
             ),
@@ -207,7 +208,7 @@ def cmd_neighbors(args: argparse.Namespace) -> int:
 
 def cmd_impact(args: argparse.Namespace) -> int:
     with closing(connect(sqlite_path(args.data_dir))) as conn:
-        repo_id = repo_filter(conn, args.repo)
+        repo_id = repo_filter(conn, normalize_repo_arg(args.repo))
         targets = impact_targets(conn, args.target, repo_id, limit=args.limit)
         output = {
             "ok": True,
@@ -226,6 +227,19 @@ def cmd_impact(args: argparse.Namespace) -> int:
         }
     emit(output, args.json)
     return 0
+
+
+def normalize_repo_arg(repo: str | None) -> str | None:
+    if repo is None:
+        return None
+    stripped = repo.strip()
+    if stripped == ".":
+        return str(Path.cwd().resolve())
+    if stripped.startswith("./"):
+        return f"{Path.cwd().resolve()}/{stripped[2:]}".rstrip("/")
+    if stripped.startswith("/") or stripped == "~" or stripped.startswith("~/"):
+        return stripped
+    return f"{Path.cwd().resolve()}/{stripped}".rstrip("/")
 
 
 def cmd_kuzu_sync(args: argparse.Namespace) -> int:
