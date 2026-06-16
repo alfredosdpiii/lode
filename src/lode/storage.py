@@ -946,6 +946,31 @@ def get_node(conn: sqlite3.Connection, node_id: str) -> dict[str, Any] | None:
 
 
 _NEIGHBOR_CONFIDENCE_ORDER = {"resolved": 0, "strong": 1}
+_NEIGHBOR_ORDER_SQL = """
+        ORDER BY
+          CASE WHEN n.kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
+          CASE e.confidence WHEN 'resolved' THEN 0 WHEN 'strong' THEN 1 ELSE 2 END,
+          COALESCE(n.path, ''),
+          CASE
+            WHEN n.id IS NULL THEN 0
+            WHEN COALESCE(n.start_line, 0) < 1 THEN 1
+            ELSE n.start_line
+          END
+        """
+_OUTGOING_NEIGHBORS_SQL = """
+        SELECT e.kind AS edge_kind, e.confidence AS edge_confidence, e.detail, n.*, 0.0 AS rank
+        FROM edges e
+        LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.dst
+        WHERE e.repo_id = ? AND e.src = ?
+        """
+_OUTGOING_NEIGHBOR_COUNT_SQL = "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND src = ?"
+_INCOMING_NEIGHBORS_SQL = """
+        SELECT e.kind AS edge_kind, e.confidence AS edge_confidence, e.detail, n.*, 0.0 AS rank
+        FROM edges e
+        LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.src
+        WHERE e.repo_id = ? AND e.dst = ?
+        """
+_INCOMING_NEIGHBOR_COUNT_SQL = "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND dst = ?"
 
 
 def neighbor_sort_key(item: dict[str, Any]) -> tuple[int, int, str, int]:
@@ -965,33 +990,51 @@ def sorted_neighbor_rows(rows: Any, limit: int) -> list[dict[str, Any]]:
     return neighbors[:limit]
 
 
+def _bounded_sorted_neighbor_rows(
+    conn: sqlite3.Connection,
+    query: str,
+    count_query: str,
+    repo_id: str,
+    node_id: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return sorted_neighbor_rows(conn.execute(query, (repo_id, node_id)), limit)
+
+    neighbor_count = conn.execute(count_query, (repo_id, node_id)).fetchone()[0]
+    if int(neighbor_count) <= limit:
+        return sorted_neighbor_rows(conn.execute(query, (repo_id, node_id)), limit)
+
+    rows = conn.execute(
+        f"{query}{_NEIGHBOR_ORDER_SQL} LIMIT ?",
+        (repo_id, node_id, limit),
+    )
+    return [neighbor_row_to_dict(row) for row in rows]
+
+
 def get_neighbors(conn: sqlite3.Connection, node_id: str, limit: int = 80) -> dict[str, Any]:
     node = get_node(conn, node_id)
     if not node:
         return {"node": None, "outgoing": [], "incoming": []}
     repo_id = str(node["repo_id"])
-    outgoing_rows = conn.execute(
-        """
-        SELECT e.kind AS edge_kind, e.confidence AS edge_confidence, e.detail, n.*, 0.0 AS rank
-        FROM edges e
-        LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.dst
-        WHERE e.repo_id = ? AND e.src = ?
-        """,
-        (repo_id, node_id),
-    )
-    incoming_rows = conn.execute(
-        """
-        SELECT e.kind AS edge_kind, e.confidence AS edge_confidence, e.detail, n.*, 0.0 AS rank
-        FROM edges e
-        LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.src
-        WHERE e.repo_id = ? AND e.dst = ?
-        """,
-        (repo_id, node_id),
-    )
     payload = {
         "node": node,
-        "outgoing": sorted_neighbor_rows(outgoing_rows, limit),
-        "incoming": sorted_neighbor_rows(incoming_rows, limit),
+        "outgoing": _bounded_sorted_neighbor_rows(
+            conn,
+            _OUTGOING_NEIGHBORS_SQL,
+            _OUTGOING_NEIGHBOR_COUNT_SQL,
+            repo_id,
+            node_id,
+            limit,
+        ),
+        "incoming": _bounded_sorted_neighbor_rows(
+            conn,
+            _INCOMING_NEIGHBORS_SQL,
+            _INCOMING_NEIGHBOR_COUNT_SQL,
+            repo_id,
+            node_id,
+            limit,
+        ),
     }
     return payload
 
