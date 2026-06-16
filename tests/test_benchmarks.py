@@ -644,6 +644,42 @@ class BenchmarkScriptTests(unittest.TestCase):
         self.assertEqual(payload["details"][0]["rank"], 1)
         self.assertEqual(payload["details"][0]["ranked_paths"][0], "services.py")
 
+    def test_repobench_adapter_context_modes_enable_related_neighbors(self) -> None:
+        adapter = load_repobench_adapter_script()
+        observed_modes: list[tuple[str, object]] = []
+        current_mode = ""
+
+        original_build_context_pack = adapter.build_context_pack
+        original_search_nodes = adapter.search_nodes
+
+        def fake_build_context_pack(
+            conn: object, query: str, **kwargs: object
+        ) -> dict[str, list[dict[str, str]]]:
+            _ = (conn, query)
+            observed_modes.append((current_mode, kwargs.get("include_related")))
+            return {"top_hits": [], "must_read": []}
+
+        def fake_search_nodes(conn: object, query: str, *, limit: int) -> list[dict[str, str]]:
+            _ = (conn, query, limit)
+            return []
+
+        try:
+            adapter.build_context_pack = fake_build_context_pack
+            adapter.search_nodes = fake_search_nodes
+            for current_mode in ["context", "hybrid"]:
+                adapter.retrieve_paths(
+                    object(),
+                    "UserService save_user",
+                    current_mode,
+                    search_limit=30,
+                    context_budget=6000,
+                )
+        finally:
+            adapter.build_context_pack = original_build_context_pack
+            adapter.search_nodes = original_search_nodes
+
+        self.assertEqual(observed_modes, [("context", True), ("hybrid", True)])
+
     def test_repobench_adapter_ranks_duplicate_path_hard_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as data_tmp:
             input_path = Path(data_tmp) / "repobench.jsonl"
@@ -799,6 +835,7 @@ class BenchmarkScriptTests(unittest.TestCase):
         self.assertEqual(payload["splits"], ["cross_file_first", "cross_file_random"])
         self.assertEqual(payload["samples_evaluated"], 2)
         self.assertEqual(payload["samples_skipped"], 0)
+        self.assertTrue(payload["context_include_related"])
         self.assertIn("hit_counts", payload)
         self.assertIn("reciprocal_rank_sum", payload)
         # Split results
@@ -807,6 +844,7 @@ class BenchmarkScriptTests(unittest.TestCase):
             split = payload["split_results"][split_name]
             self.assertEqual(split["split"], split_name)
             self.assertEqual(split["dataset"], "tianyang/repobench_python_v1.1")
+            self.assertTrue(split["context_include_related"])
             self.assertEqual(split["samples_evaluated"], 1)
             self.assertEqual(split["samples_skipped"], 0)
             self.assertIn("hit_counts", split)

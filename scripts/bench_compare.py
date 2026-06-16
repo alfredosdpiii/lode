@@ -43,6 +43,7 @@ APPROVED_PARAMETERS: dict[str, dict[str, Any]] = {
     "repobench": {
         "input": "/home/bryan/.cache/lode/benchmarks/repobench_python_v1.1/jsonl",
         "mode": "context",
+        "context_include_related": True,
         "top_k": [1, 3, 5, 10],
         "query_lines": 5,
         "search_limit": 30,
@@ -258,6 +259,7 @@ def extract_parameters(current: dict[str, Any], comp_type: str) -> dict[str, Any
         return {
             "input": current.get("input"),
             "mode": current.get("mode"),
+            "context_include_related": current.get("context_include_related"),
             "top_k": current.get("top_k"),
             "query_lines": current.get("query_lines"),
             "search_limit": current.get("search_limit"),

@@ -39,6 +39,7 @@ EMBEDDING_PARAMETERS = {
 REPOBENCH_PARAMETERS = {
     "input": "/home/bryan/.cache/lode/benchmarks/repobench_python_v1.1/jsonl",
     "mode": "context",
+    "context_include_related": True,
     "top_k": [1, 3, 5, 10],
     "query_lines": 5,
     "search_limit": 30,
@@ -606,6 +607,7 @@ class BenchCompareRepoBenchTests(unittest.TestCase):
         current["input"] = "/home/bryan/.cache/lode/benchmarks/repobench_python_v1.1/jsonl"
         current["start"] = 0
         current["limit"] = None
+        current["context_include_related"] = True
         # Improve all quality metrics and lower latency
         for key in ["hit_at_1", "hit_at_3", "hit_at_5", "hit_at_10", "mrr"]:
             current["metrics"][key] = 0.99
@@ -635,8 +637,80 @@ class BenchCompareRepoBenchTests(unittest.TestCase):
             self.assertIn("split_results", payload)
             self.assertIn("approved_parameters", payload)
             self.assertIn("current_parameters", payload)
+            self.assertTrue(payload["current_parameters"]["context_include_related"])
             self.assertNotIn("parameter_diagnostics", payload)
             self.assertNotIn("invariant_issues", payload)
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_repobench_comparator_fails_missing_context_include_related(self) -> None:
+        current = load_repobench_baseline()
+        current["input"] = "/home/bryan/.cache/lode/benchmarks/repobench_python_v1.1/jsonl"
+        current["start"] = 0
+        current["limit"] = None
+        for key in ["hit_at_1", "hit_at_3", "hit_at_5", "hit_at_10", "mrr"]:
+            current["metrics"][key] = 0.99
+        current["timing_ms"]["retrieve_mean"] = 0.01
+        for split in ["cross_file_first", "cross_file_random"]:
+            for key in ["hit_at_1", "hit_at_3", "hit_at_5", "hit_at_10", "mrr"]:
+                current["split_results"][split]["metrics"][key] = 0.99
+            current["split_results"][split]["timing_ms"]["retrieve_mean"] = 0.01
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "repobench", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            diagnostics = payload["parameter_diagnostics"]
+            context_diag = [d for d in diagnostics if d["parameter"] == "context_include_related"]
+            self.assertEqual(len(context_diag), 1)
+            self.assertTrue(context_diag[0]["expected"])
+            self.assertIsNone(context_diag[0]["actual"])
+        finally:
+            current_path.unlink(missing_ok=True)
+
+    def test_repobench_comparator_fails_disabled_context_include_related(self) -> None:
+        current = load_repobench_baseline()
+        current["input"] = "/home/bryan/.cache/lode/benchmarks/repobench_python_v1.1/jsonl"
+        current["start"] = 0
+        current["limit"] = None
+        current["context_include_related"] = False
+        for key in ["hit_at_1", "hit_at_3", "hit_at_5", "hit_at_10", "mrr"]:
+            current["metrics"][key] = 0.99
+        current["timing_ms"]["retrieve_mean"] = 0.01
+        for split in ["cross_file_first", "cross_file_random"]:
+            for key in ["hit_at_1", "hit_at_3", "hit_at_5", "hit_at_10", "mrr"]:
+                current["split_results"][split]["metrics"][key] = 0.99
+            current["split_results"][split]["timing_ms"]["retrieve_mean"] = 0.01
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump(current, fh)
+            current_path = Path(fh.name)
+
+        try:
+            result = subprocess.run(
+                [*BENCH_COMPARE, "--type", "repobench", "--current", str(current_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["overall_pass"])
+            diagnostics = payload["parameter_diagnostics"]
+            context_diag = [d for d in diagnostics if d["parameter"] == "context_include_related"]
+            self.assertEqual(len(context_diag), 1)
+            self.assertTrue(context_diag[0]["expected"])
+            self.assertFalse(context_diag[0]["actual"])
         finally:
             current_path.unlink(missing_ok=True)
 

@@ -44,6 +44,7 @@ _STOPWORDS = set(keyword.kwlist) | {
     "super",
     "__init__",
 }
+_CONTEXT_RELATED_MODES = {"context", "hybrid"}
 
 
 @dataclass
@@ -81,6 +82,7 @@ class _MaterializedSample:
     target_path: str
     current_path: str
     cropped_code: str
+    import_terms: frozenset[str]
     candidates: list[_MaterializedCandidate]
 
 
@@ -331,6 +333,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "input_files": [f.name for f in input_files],
         "splits": split_names,
         "mode": args.mode,
+        "context_include_related": context_include_related(args.mode),
         "samples_evaluated": total_evaluated,
         "samples_skipped": total_skipped,
         "top_k": top_k,
@@ -432,6 +435,7 @@ def _build_split_result(
         "split": split_name,
         "dataset": dataset,
         "mode": args.mode,
+        "context_include_related": context_include_related(args.mode),
         "samples_evaluated": acc.evaluated,
         "samples_skipped": acc.skipped,
         "top_k": top_k,
@@ -538,6 +542,7 @@ def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> _MaterializedS
         target_path=target_path,
         current_path=current_path.as_posix(),
         cropped_code=cropped_code,
+        import_terms=frozenset(_import_query_terms(cropped_code)),
         candidates=candidates,
     )
 
@@ -597,7 +602,7 @@ def retrieve_paths(
             query,
             budget=context_budget,
             limit=min(search_limit, 20),
-            include_related=False,
+            include_related=context_include_related(mode),
         )
         paths.extend(item["path"] for item in pack.get("top_hits") or [])
         paths.extend(item["path"] for item in pack.get("must_read") or [])
@@ -607,6 +612,10 @@ def retrieve_paths(
     return paths
 
 
+def context_include_related(mode: str) -> bool:
+    return mode in _CONTEXT_RELATED_MODES
+
+
 def rerank_materialized_candidates(
     query: str,
     materialized: _MaterializedSample,
@@ -614,11 +623,12 @@ def rerank_materialized_candidates(
     limit: int,
 ) -> list[str]:
     query_terms = _weighted_query_terms(query)
-    import_terms = set(_import_query_terms(materialized.cropped_code))
+    query_set = set(query_terms)
+    import_terms = materialized.import_terms
     lode_rank = {path: index for index, path in enumerate(lode_paths)}
     ranked: list[tuple[float, int, int, str]] = []
     for candidate in materialized.candidates:
-        score = _candidate_score(candidate, query_terms, import_terms)
+        score = _candidate_score(candidate, query_terms, query_set, import_terms)
         if candidate.path in lode_rank:
             score += max(0.0, 12.0 - float(lode_rank[candidate.path])) * 0.75
         if score <= 0.0:
@@ -638,14 +648,14 @@ def rerank_materialized_candidates(
 def _candidate_score(
     candidate: _MaterializedCandidate,
     query_terms: dict[str, float],
-    import_terms: set[str],
+    query_set: set[str],
+    import_terms: frozenset[str],
 ) -> float:
     if not query_terms and not import_terms:
         return 0.0
     identifier_terms = candidate.identifier_terms
     path_terms = candidate.path_terms
     snippet_terms = candidate.snippet_terms
-    query_set = set(query_terms)
 
     score = 0.0
     score += 8.0 * len(query_set & identifier_terms)
@@ -666,7 +676,11 @@ def _candidate_score(
 
 
 def _weighted_query_terms(query: str) -> dict[str, float]:
-    terms = _identifier_tokens(query)
+    terms = [
+        token.lower()
+        for token in query.split()
+        if len(token) > 1 and token.lower() not in _STOPWORDS
+    ]
     weights: dict[str, float] = {}
     for index, term in enumerate(terms[:32]):
         weights[term] = max(weights.get(term, 0.0), 1.0 - min(index, 31) / 40.0)
