@@ -23,8 +23,10 @@ from .storage import (
     pending_embedding_nodes,
     repo_filter,
     search_nodes,
-    upsert_embedding,
+    upsert_embeddings,
 )
+
+EMBEDDING_TEXT_MAX_INPUT_CHARS = 384
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -143,7 +145,10 @@ def cmd_index(args: argparse.Namespace) -> int:
     stats = index_repo(args.path, sqlite_path(args.data_dir))
     output: dict[str, Any] = {"ok": True, **asdict(stats)}
     if args.sync_kuzu:
-        output["kuzu"] = sync_kuzu(args)
+        kuzu = sync_kuzu(args)
+        output["kuzu"] = kuzu
+        output["nodes"] = kuzu["nodes"]
+        output["edges"] = kuzu["edges"]
     emit(output, args.json)
     return 0
 
@@ -157,7 +162,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_search(args: argparse.Namespace) -> int:
     with closing(connect(sqlite_path(args.data_dir))) as conn:
-        repo_id = repo_filter(conn, args.repo)
+        repo_id = repo_filter(conn, normalize_repo_arg(args.repo))
         output = {
             "ok": True,
             "results": search_nodes(conn, args.query, repo_id=repo_id, limit=args.limit),
@@ -168,7 +173,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_symbol(args: argparse.Namespace) -> int:
     with closing(connect(sqlite_path(args.data_dir))) as conn:
-        repo_id = repo_filter(conn, args.repo)
+        repo_id = repo_filter(conn, normalize_repo_arg(args.repo))
         output = {
             "ok": True,
             "results": find_symbol(conn, args.name, repo_id=repo_id, limit=args.limit),
@@ -179,12 +184,13 @@ def cmd_symbol(args: argparse.Namespace) -> int:
 
 def cmd_context(args: argparse.Namespace) -> int:
     with closing(connect(sqlite_path(args.data_dir))) as conn:
+        repo_path = normalize_repo_arg(args.repo)
         output = {
             "ok": True,
             **build_context_pack(
                 conn,
                 args.query,
-                repo_path=args.repo,
+                repo_path=repo_path,
                 budget=args.budget,
                 limit=args.limit,
             ),
@@ -202,7 +208,7 @@ def cmd_neighbors(args: argparse.Namespace) -> int:
 
 def cmd_impact(args: argparse.Namespace) -> int:
     with closing(connect(sqlite_path(args.data_dir))) as conn:
-        repo_id = repo_filter(conn, args.repo)
+        repo_id = repo_filter(conn, normalize_repo_arg(args.repo))
         targets = impact_targets(conn, args.target, repo_id, limit=args.limit)
         output = {
             "ok": True,
@@ -221,6 +227,19 @@ def cmd_impact(args: argparse.Namespace) -> int:
         }
     emit(output, args.json)
     return 0
+
+
+def normalize_repo_arg(repo: str | None) -> str | None:
+    if repo is None:
+        return None
+    stripped = repo.strip()
+    if stripped == ".":
+        return str(Path.cwd().resolve())
+    if stripped.startswith("./"):
+        return f"{Path.cwd().resolve()}/{stripped[2:]}".rstrip("/")
+    if stripped.startswith("/") or stripped == "~" or stripped.startswith("~/"):
+        return stripped
+    return f"{Path.cwd().resolve()}/{stripped}".rstrip("/")
 
 
 def cmd_kuzu_sync(args: argparse.Namespace) -> int:
@@ -242,7 +261,13 @@ def cmd_embed(args: argparse.Namespace) -> int:
     with closing(connect(sqlite_path(args.data_dir))) as conn:
         nodes = pending_embedding_nodes(conn, limit=args.limit)
         if not nodes:
-            output = {"ok": True, "embedded": 0, **embedding_counts(conn)}
+            counts = embedding_counts(conn)
+            output = {
+                "ok": True,
+                **counts,
+                "total_embeddings": counts["embedded"],
+                "embedded": 0,
+            }
             emit(output, args.json)
             return 0
 
@@ -253,9 +278,20 @@ def cmd_embed(args: argparse.Namespace) -> int:
                 f"Embedding endpoint returned {len(vectors)} vectors for {len(nodes)} texts"
             )
         model = args.model or embeddings_model()
-        for node, vector in zip(nodes, vectors):
-            upsert_embedding(conn, node["id"], node["repo_id"], vector, model)
-        output = {"ok": True, "embedded": len(vectors), **embedding_counts(conn)}
+        upsert_embeddings(
+            conn,
+            [
+                (str(node["id"]), str(node["repo_id"]), vector, model)
+                for node, vector in zip(nodes, vectors)
+            ],
+        )
+        counts = embedding_counts(conn)
+        output = {
+            "ok": True,
+            **counts,
+            "total_embeddings": counts["embedded"],
+            "embedded": len(vectors),
+        }
     emit(output, args.json)
     return 0
 
@@ -266,7 +302,23 @@ def embedding_text(node: dict[str, Any]) -> str:
         str(node.get("signature") or ""),
         str(node.get("doc") or ""),
     ]
-    return "\n".join(part for part in parts if part)
+    return join_bounded_embedding_parts(parts)
+
+
+def join_bounded_embedding_parts(parts: list[str]) -> str:
+    out: list[str] = []
+    used = 0
+    for part in parts:
+        if not part:
+            continue
+        separator_chars = 1 if out else 0
+        available = EMBEDDING_TEXT_MAX_INPUT_CHARS - used - separator_chars
+        if available <= 0:
+            break
+        segment = part[:available]
+        out.append(segment)
+        used += separator_chars + len(segment)
+    return "\n".join(out)
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

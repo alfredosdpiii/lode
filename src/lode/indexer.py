@@ -4,6 +4,9 @@ import ast
 import hashlib
 import os
 import re
+import time
+from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,8 +15,8 @@ from .graph import resolve_graph
 from .model import Edge, FileIndex, Node
 from .storage import (
     connect,
-    remove_missing_files,
-    replace_file_index,
+    remove_missing_file_rows,
+    replace_file_indexes_rows,
     upsert_repo,
 )
 
@@ -34,6 +37,18 @@ SOURCE_EXTENSIONS = {
     ".toml": "toml",
 }
 
+AST_TRAVERSAL_LEAF_TYPES = (
+    ast.expr_context,
+    ast.operator,
+    ast.unaryop,
+    ast.cmpop,
+    ast.boolop,
+    ast.Constant,
+    ast.Name,
+    ast.arg,
+    ast.alias,
+)
+
 EXCLUDED_DIRS = {
     ".git",
     ".hg",
@@ -53,7 +68,13 @@ EXCLUDED_DIRS = {
     ".local-repo-kg",
     ".lode",
     ".kg",
+    "bench-results",
+    "droid-wiki",
 }
+
+PARALLEL_PARSE_THRESHOLD = 8
+MAX_PARSE_WORKERS = 6
+ParseJob = tuple[str, str, str, float, int, str]
 
 
 @dataclass(slots=True)
@@ -80,33 +101,84 @@ def index_repo(repo_path: Path, db_path: Path | None = None) -> IndexStats:
         repo_id = upsert_repo(conn, root)
         stats = IndexStats(repo_id=repo_id, root=str(root))
         live_paths: set[str] = set()
-        previous_hashes = {
-            row["path"]: row["content_hash"]
+        parse_jobs: list[ParseJob] = []
+        skipped_updates: list[tuple[float, float, str, str]] = []
+        previous_files = {
+            row["path"]: {
+                "content_hash": row["content_hash"],
+                "size": row["size"],
+                "mtime": row["mtime"],
+            }
             for row in conn.execute(
-                "SELECT path, content_hash FROM files WHERE repo_id = ?", (repo_id,)
+                "SELECT path, content_hash, size, mtime FROM files WHERE repo_id = ?", (repo_id,)
             )
         }
         for path in iter_source_files(root):
             rel = path.relative_to(root).as_posix()
-            live_paths.add(rel)
             stats.scanned += 1
-            digest = hash_file(path)
-            if previous_hashes.get(rel) == digest:
-                stats.skipped_unchanged += 1
+            try:
+                stat = path.stat()
+            except OSError:
                 continue
-            file_index = parse_file(root, path, digest)
-            replace_file_index(conn, repo_id, file_index)
-            stats.indexed += 1
-            stats.nodes += len(file_index.nodes)
-            stats.edges += len(file_index.edges)
-        stats.removed = remove_missing_files(conn, repo_id, live_paths)
-        resolved = resolve_graph(conn, repo_id)
-        stats.resolved_imports = resolved.get("imports", 0)
-        stats.resolved_calls = resolved.get("calls", 0)
-        stats.resolved_extends = resolved.get("extends", 0)
+            live_paths.add(rel)
+            prev = previous_files.get(rel)
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                live_paths.discard(rel)
+                continue
+            digest = hashlib.sha1(raw).hexdigest()
+            if prev and prev["content_hash"] == digest:
+                stats.skipped_unchanged += 1
+                skipped_updates.append((stat.st_mtime, time.time(), repo_id, rel))
+                continue
+            text = raw.decode("utf-8", errors="replace")
+            parse_jobs.append((str(root), str(path), digest, stat.st_mtime, stat.st_size, text))
+        if should_parse_in_parallel(parse_jobs):
+            conn.commit()
+            conn.close()
+            changed_files = parse_file_jobs(parse_jobs)
+            conn = connect(db_path)
+        else:
+            changed_files = parse_file_jobs(parse_jobs)
+        stats.indexed = len(changed_files)
+        stats.nodes = sum(len(file_index.nodes) for file_index in changed_files)
+        stats.edges = sum(len(file_index.edges) for file_index in changed_files)
+        with conn:
+            if skipped_updates:
+                conn.executemany(
+                    "UPDATE files SET mtime = ?, indexed_at = ? WHERE repo_id = ? AND path = ?",
+                    skipped_updates,
+                )
+            replace_file_indexes_rows(conn, repo_id, changed_files)
+            stats.removed = remove_missing_file_rows(conn, repo_id, live_paths)
+        if stats.indexed > 0 or stats.removed > 0:
+            resolved = resolve_graph(conn, repo_id)
+            stats.resolved_imports = resolved.get("imports", 0)
+            stats.resolved_calls = resolved.get("calls", 0)
+            stats.resolved_extends = resolved.get("extends", 0)
         return stats
     finally:
         conn.close()
+
+
+def should_parse_in_parallel(parse_jobs: list[ParseJob]) -> bool:
+    return len(parse_jobs) >= PARALLEL_PARSE_THRESHOLD and (os.cpu_count() or 1) > 1
+
+
+def parse_file_jobs(parse_jobs: list[ParseJob]) -> list[FileIndex]:
+    if not parse_jobs:
+        return []
+    if not should_parse_in_parallel(parse_jobs):
+        return [_parse_file_job(job) for job in parse_jobs]
+    worker_count = min(MAX_PARSE_WORKERS, len(parse_jobs), os.cpu_count() or 1)
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(_parse_file_job, parse_jobs, chunksize=1))
+
+
+def _parse_file_job(job: ParseJob) -> FileIndex:
+    root, path, digest, mtime, size, text = job
+    return parse_file(Path(root), Path(path), digest, mtime, size, text)
 
 
 def iter_source_files(root: Path):
@@ -134,18 +206,18 @@ def is_probably_generated(path: Path) -> bool:
         return True
 
 
-def hash_file(path: Path) -> str:
-    h = hashlib.sha1()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def parse_file(root: Path, path: Path, digest: str | None = None) -> FileIndex:
+def parse_file(
+    root: Path,
+    path: Path,
+    digest: str | None = None,
+    mtime: float = 0.0,
+    size: int | None = None,
+    text: str | None = None,
+) -> FileIndex:
     rel = path.relative_to(root).as_posix()
     language = SOURCE_EXTENSIONS.get(path.suffix.lower(), "text")
-    text = path.read_text(encoding="utf-8", errors="replace")
+    if text is None:
+        text = path.read_text(encoding="utf-8", errors="replace")
     content_hash = digest or hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
     file_node = make_node(
         "File",
@@ -171,19 +243,45 @@ def parse_file(root: Path, path: Path, digest: str | None = None) -> FileIndex:
         import_bindings = []
     nodes.extend(extra_nodes)
     edges.extend(extra_edges)
+    nodes = dedupe_parsed_nodes(nodes)
+    edges = dedupe_parsed_edges(edges)
     if import_bindings:
         file_node.extra["imports"] = import_bindings
-    size = path.stat().st_size
+    file_size = size if size is not None else path.stat().st_size
     return FileIndex(
         path=rel,
         abspath=str(path),
         language=language,
-        size=size,
+        size=file_size,
+        mtime=mtime,
         content_hash=content_hash,
         generated=False,
         nodes=nodes,
         edges=edges,
     )
+
+
+def dedupe_parsed_nodes(nodes: list[Node]) -> list[Node]:
+    seen: set[str] = set()
+    out: list[Node] = []
+    for node in nodes:
+        if node.id in seen:
+            continue
+        seen.add(node.id)
+        out.append(node)
+    return out
+
+
+def dedupe_parsed_edges(edges: list[Edge]) -> list[Edge]:
+    seen: set[tuple[str, str, str, str]] = set()
+    out: list[Edge] = []
+    for edge in edges:
+        key = (edge.src, edge.dst, edge.kind, edge.detail)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(edge)
+    return out
 
 
 def make_node(
@@ -256,6 +354,17 @@ def parse_python(
     nodes: list[Node] = []
     edges: list[Edge] = []
     import_bindings: list[dict[str, Any]] = []
+    external_cache: dict[tuple[str, str], Node] = {}
+
+    def cached_external_node(kind: str, name: str) -> Node:
+        key = (kind, name)
+        node = external_cache.get(key)
+        if node is None:
+            node = external_node(kind, name, rel)
+            external_cache[key] = node
+            nodes.append(node)
+        return node
+
     module = module_qname(rel)
     try:
         tree = ast.parse(text)
@@ -273,10 +382,11 @@ def parse_python(
         )
         return [node], [Edge(file_node_id, node.id, "HAS_PARSE_ERROR", "exact")], []
 
+    lines = text.splitlines()
     symbol_by_name: dict[str, str] = {}
     for item in tree.body:
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            node = python_function_node(module, rel, item, text)
+            node = python_function_node(module, rel, item, lines)
             nodes.append(node)
             symbol_by_name[item.name] = node.id
             edges.append(Edge(file_node_id, node.id, "DEFINES", "exact"))
@@ -284,15 +394,14 @@ def parse_python(
             nodes.extend(route_nodes)
             edges.extend(route_edges)
         elif isinstance(item, ast.ClassDef):
-            class_node = python_class_node(module, rel, item, text)
+            class_node = python_class_node(module, rel, item, lines)
             nodes.append(class_node)
             symbol_by_name[item.name] = class_node.id
             edges.append(Edge(file_node_id, class_node.id, "DEFINES", "exact"))
             for base in item.bases:
                 base_name = dotted_name(base)
                 if base_name:
-                    base_node = external_node("ExternalSymbol", base_name, rel)
-                    nodes.append(base_node)
+                    base_node = cached_external_node("ExternalSymbol", base_name)
                     edges.append(
                         Edge(
                             class_node.id,
@@ -305,7 +414,7 @@ def parse_python(
             for child in item.body:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     method = python_function_node(
-                        f"{module}.{item.name}", rel, child, text, kind="Method"
+                        f"{module}.{item.name}", rel, child, lines, kind="Method"
                     )
                     nodes.append(method)
                     edges.append(Edge(class_node.id, method.id, "CONTAINS", "exact"))
@@ -316,15 +425,15 @@ def parse_python(
                     nodes.extend(route_nodes)
                     edges.extend(route_edges)
 
-    for import_node in ast.walk(tree):
+    call_nodes: list[ast.Call] = []
+    for import_node in iter_imports_and_calls(tree):
         if isinstance(import_node, ast.Import):
             for alias in import_node.names:
                 import_module = alias.name
                 import_bindings.append(
                     {"module": import_module, "name": None, "alias": alias.asname}
                 )
-                dep = external_node("ExternalDependency", import_module, rel)
-                nodes.append(dep)
+                dep = cached_external_node("ExternalDependency", import_module)
                 edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", import_module))
         elif isinstance(import_node, ast.ImportFrom):
             module = import_node.module or ""
@@ -340,12 +449,13 @@ def parse_python(
                 else:
                     import_bindings.append({"module": module, "name": alias.name, "alias": None})
             if module:
-                dep = external_node("ExternalDependency", module, rel)
-                nodes.append(dep)
+                dep = cached_external_node("ExternalDependency", module)
                 edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", module))
+        elif isinstance(import_node, ast.Call):
+            call_nodes.append(import_node)
 
     function_stack = build_python_function_ranges(nodes)
-    for call in [n for n in ast.walk(tree) if isinstance(n, ast.Call)]:
+    for call in call_nodes:
         call_name = dotted_name(call.func)
         if not call_name:
             continue
@@ -356,17 +466,30 @@ def parse_python(
         if target_id:
             edges.append(Edge(caller_id, target_id, "CALLS", "strong", call_name))
         else:
-            target = external_node("ExternalSymbol", call_name, rel)
-            nodes.append(target)
+            target = cached_external_node("ExternalSymbol", call_name)
             edges.append(Edge(caller_id, target.id, "CALLS", "heuristic", call_name))
     return nodes, edges, import_bindings
+
+
+def iter_imports_and_calls(tree: ast.AST) -> Iterator[ast.Import | ast.ImportFrom | ast.Call]:
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Call)):
+            yield node
+        children = [
+            child
+            for child in ast.iter_child_nodes(node)
+            if not isinstance(child, AST_TRAVERSAL_LEAF_TYPES)
+        ]
+        stack.extend(reversed(children))
 
 
 def python_function_node(
     prefix: str,
     rel: str,
     node: ast.FunctionDef | ast.AsyncFunctionDef,
-    text: str,
+    lines: list[str],
     kind: str = "Function",
 ) -> Node:
     args = [arg.arg for arg in node.args.args]
@@ -378,7 +501,7 @@ def python_function_node(
     start = getattr(node, "lineno", 1)
     end = getattr(node, "end_lineno", start)
     doc = ast.get_docstring(node) or ""
-    body = slice_lines(text, start, end)
+    body = slice_lines(lines, start, end)
     return make_node(
         kind,
         node.name,
@@ -393,14 +516,14 @@ def python_function_node(
     )
 
 
-def python_class_node(module: str, rel: str, node: ast.ClassDef, text: str) -> Node:
+def python_class_node(module: str, rel: str, node: ast.ClassDef, lines: list[str]) -> Node:
     start = getattr(node, "lineno", 1)
     end = getattr(node, "end_lineno", start)
     bases = [dotted_name(base) for base in node.bases]
     bases = [base for base in bases if base]
     signature = f"class {node.name}" + (f"({', '.join(bases)})" if bases else "")
     doc = ast.get_docstring(node) or ""
-    body = slice_lines(text, start, end)
+    body = slice_lines(lines, start, end)
     return make_node(
         "Class",
         node.name,
@@ -683,9 +806,8 @@ def parse_config(
 
 
 def external_node(kind: str, name: str, rel: str) -> Node:
-    return make_node(kind, name, f"external:{name}", rel, 0, 0, name, confidence="heuristic")
+    return make_node(kind, name, f"external:{name}", rel, 1, 1, name, confidence="heuristic")
 
 
-def slice_lines(text: str, start: int, end: int) -> str:
-    lines = text.splitlines()
+def slice_lines(lines: list[str], start: int, end: int) -> str:
     return "\n".join(lines[max(0, start - 1) : max(start, end)])

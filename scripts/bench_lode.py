@@ -19,6 +19,7 @@ from typing import Any, TypeVar
 from lode.cli import embedding_text
 from lode.config import kuzu_path, sqlite_path
 from lode.context import build_context_pack
+from lode.embeddings import embeddings_model
 from lode.indexer import index_repo
 from lode.storage import (
     connect,
@@ -27,7 +28,7 @@ from lode.storage import (
     get_neighbors,
     pending_embedding_nodes,
     search_nodes,
-    upsert_embedding,
+    upsert_embeddings,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         RuntimeError,
         sqlite3.Error,
         urllib.error.URLError,
+        ValueError,
     ) as exc:
         if args.json:
             print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
@@ -112,6 +114,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     repo = args.repo.expanduser().resolve()
     if not repo.is_dir():
         raise FileNotFoundError(f"Repository does not exist: {repo}")
+    if args.embed_limit < 0:
+        raise ValueError("Embedding limit must be non-negative")
     repeat = max(1, args.repeat)
 
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
@@ -152,7 +156,21 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     conn, queries, repeat, args.budget, min(args.limit, 10)
                 ),
                 "neighbors": benchmark_neighbors(conn, neighbor_node_id, repeat),
+                "parameters": {
+                    "repo": str(repo),
+                    "repeat": repeat,
+                    "limit": args.limit,
+                    "budget": args.budget,
+                    "queries": queries,
+                    "symbols": symbols,
+                    "include_kuzu": args.include_kuzu,
+                    "embed_url": args.embed_url,
+                    "embed_limit": args.embed_limit,
+                },
             }
+
+            if args.embed_url:
+                result["parameters"]["model"] = embeddings_model()
 
             if args.include_kuzu:
                 result["kuzu"] = benchmark_kuzu(conn, data_dir)
@@ -279,17 +297,24 @@ def benchmark_embeddings(
             f"Embedding endpoint returned {len(vectors)} vectors for {len(nodes)} texts"
         )
     model = embeddings_model()
-    for node, vector in zip(nodes, vectors):
-        upsert_embedding(conn, node["id"], node["repo_id"], vector, model)
+    upsert_embeddings(
+        conn,
+        [
+            (str(node["id"]), str(node["repo_id"]), vector, model)
+            for node, vector in zip(nodes, vectors)
+        ],
+    )
     dims = len(vectors[0]) if vectors else 0
     per_second = 1000.0 * len(vectors) / elapsed if elapsed > 0 else 0.0
+    counts = embedding_counts(conn)
     return {
         "timing_ms": round(elapsed, 3),
         "embedded": len(vectors),
         "dims": dims,
         "vectors_per_second": round(per_second, 3),
         "model": model,
-        **embedding_counts(conn),
+        "queued": counts["queued"],
+        "total_embeddings": counts["embedded"],
     }
 
 

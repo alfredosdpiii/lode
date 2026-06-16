@@ -35,6 +35,7 @@ class FileIndex:
     abspath: str
     language: str
     size: int
+    mtime: float
     content_hash: str
     generated: bool
     nodes: list[Node]

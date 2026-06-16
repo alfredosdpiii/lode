@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: loded local daemon API
-  version: 0.1.2
+  version: 0.1.3
   description: Local-first API for indexing and querying repository knowledge graphs.
 servers:
   - url: http://127.0.0.1:7979
@@ -12,23 +12,49 @@ paths:
       responses:
         "200":
           description: Daemon is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "404":
+          $ref: "#/components/responses/JsonNotFound"
   /metrics:
     get:
       summary: Prometheus metrics
       responses:
         "200":
           description: Text metrics for local daemon requests.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/JsonNotFound"
   /status:
     get:
       summary: Repository status
       responses:
         "200":
           description: Indexed repository metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "404":
+          $ref: "#/components/responses/JsonNotFound"
   /search:
     get:
       summary: Search indexed nodes
       parameters:
         - name: q
+          in: query
+          schema:
+            type: string
+        - name: query
+          in: query
+          schema:
+            type: string
+        - name: repo
           in: query
           schema:
             type: string
@@ -39,6 +65,14 @@ paths:
       responses:
         "200":
           description: Search results.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "400":
+          $ref: "#/components/responses/JsonBadRequest"
+        "404":
+          $ref: "#/components/responses/JsonNotFound"
     post:
       summary: Search indexed nodes
       requestBody:
@@ -58,6 +92,14 @@ paths:
       responses:
         "200":
           description: Search results.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "400":
+          $ref: "#/components/responses/JsonBadRequest"
+        "404":
+          $ref: "#/components/responses/JsonNotFound"
   /index:
     post:
       summary: Index a repository path
@@ -74,6 +116,14 @@ paths:
       responses:
         "200":
           description: Indexing stats.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexResponse"
+        "400":
+          $ref: "#/components/responses/JsonBadRequest"
+        "404":
+          $ref: "#/components/responses/JsonNotFound"
   /context:
     post:
       summary: Build an agent context pack
@@ -96,14 +146,48 @@ paths:
       responses:
         "200":
           description: Context pack.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContextResponse"
+        "400":
+          $ref: "#/components/responses/JsonBadRequest"
+        "404":
+          $ref: "#/components/responses/JsonNotFound"
   /impact:
     get:
       summary: Compute impact for a target
       parameters:
         - name: target
           in: query
+          description: Required unless the q alias is supplied.
           schema:
             type: string
+        - name: q
+          in: query
+          description: Alias for target.
+          schema:
+            type: string
+        - name: repo
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: neighbor_limit
+          in: query
+          schema:
+            type: integer
+        - name: depth
+          in: query
+          schema:
+            type: integer
+        - name: max_nodes
+          in: query
+          schema:
+            type: integer
         - name: direction
           in: query
           schema:
@@ -112,6 +196,14 @@ paths:
       responses:
         "200":
           description: Impact report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImpactResponse"
+        "400":
+          $ref: "#/components/responses/JsonBadRequest"
+        "404":
+          $ref: "#/components/responses/JsonNotFound"
     post:
       summary: Compute impact for a target
       requestBody:
@@ -126,6 +218,10 @@ paths:
                   type: string
                 repo:
                   type: string
+                limit:
+                  type: integer
+                neighbor_limit:
+                  type: integer
                 direction:
                   type: string
                   enum: [up, down, both]
@@ -136,3 +232,210 @@ paths:
       responses:
         "200":
           description: Impact report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImpactResponse"
+        "400":
+          $ref: "#/components/responses/JsonBadRequest"
+        "404":
+          $ref: "#/components/responses/JsonNotFound"
+components:
+  responses:
+    JsonBadRequest:
+      description: JSON validation error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    JsonNotFound:
+      description: JSON not found error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+    HealthResponse:
+      type: object
+      required: [ok, service]
+      properties:
+        ok:
+          type: boolean
+        service:
+          type: string
+    RepoStatus:
+      type: object
+      required: [id, root, name, indexed_at, files, nodes]
+      properties:
+        id:
+          type: string
+        root:
+          type: string
+        name:
+          type: string
+        indexed_at:
+          type: number
+        files:
+          type: integer
+        nodes:
+          type: integer
+    StatusResponse:
+      type: object
+      required: [ok, repos]
+      properties:
+        ok:
+          type: boolean
+        repos:
+          type: array
+          items:
+            $ref: "#/components/schemas/RepoStatus"
+    Node:
+      type: object
+      required:
+        - id
+        - repo_id
+        - owner_path
+        - kind
+        - name
+        - qname
+        - path
+        - start_line
+        - end_line
+        - signature
+        - doc
+        - confidence
+        - content_hash
+        - rank
+        - extra
+      properties:
+        id:
+          type: string
+        repo_id:
+          type: string
+        owner_path:
+          type: string
+        kind:
+          type: string
+        name:
+          type: string
+        qname:
+          type: string
+        path:
+          type: string
+        start_line:
+          type: integer
+        end_line:
+          type: integer
+        signature:
+          type: string
+        doc:
+          type: string
+        confidence:
+          type: string
+        content_hash:
+          type: string
+        rank:
+          type: number
+        extra:
+          type: object
+    SearchResponse:
+      type: object
+      required: [ok, results]
+      properties:
+        ok:
+          type: boolean
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Node"
+    IndexResponse:
+      type: object
+      required:
+        - ok
+        - repo_id
+        - root
+        - scanned
+        - indexed
+        - skipped_unchanged
+        - removed
+        - resolved_imports
+        - resolved_calls
+        - resolved_extends
+        - nodes
+        - edges
+      properties:
+        ok:
+          type: boolean
+        repo_id:
+          type: string
+        root:
+          type: string
+        scanned:
+          type: integer
+        indexed:
+          type: integer
+        skipped_unchanged:
+          type: integer
+        removed:
+          type: integer
+        resolved_imports:
+          type: integer
+        resolved_calls:
+          type: integer
+        resolved_extends:
+          type: integer
+        nodes:
+          type: integer
+        edges:
+          type: integer
+    ContextResponse:
+      type: object
+      required: [ok, query, budget, must_read, top_hits, summary, related, confidence, notes]
+      properties:
+        ok:
+          type: boolean
+        query:
+          type: string
+        budget:
+          type: integer
+        must_read:
+          type: array
+          items:
+            type: object
+        top_hits:
+          type: array
+          items:
+            type: object
+        summary:
+          type: string
+        related:
+          type: array
+          items:
+            type: object
+        confidence:
+          type: string
+        notes:
+          type: array
+          items:
+            type: string
+    ImpactResponse:
+      type: object
+      required: [ok, query, results]
+      properties:
+        ok:
+          type: boolean
+        query:
+          type: string
+        results:
+          type: array
+          items:
+            type: object

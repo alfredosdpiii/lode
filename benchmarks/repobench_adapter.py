@@ -1,16 +1,17 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
 import json
+import keyword
 import re
 import shutil
 import sqlite3
 import sys
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterator
 from contextlib import closing
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from statistics import mean
 from typing import Any
@@ -19,6 +20,70 @@ from lode.config import sqlite_path
 from lode.context import build_context_pack
 from lode.indexer import index_repo
 from lode.storage import connect, search_nodes
+
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+_STOPWORDS = set(keyword.kwlist) | {
+    "self",
+    "cls",
+    "none",
+    "true",
+    "false",
+    "return",
+    "def",
+    "class",
+    "import",
+    "from",
+    "as",
+    "with",
+    "for",
+    "while",
+    "try",
+    "except",
+    "finally",
+    "super",
+    "__init__",
+}
+_CONTEXT_RELATED_MODES = {"context", "hybrid"}
+
+
+@dataclass
+class _Accumulator:
+    hits: dict[int, int] = field(default_factory=lambda: {})
+    reciprocal_ranks: list[float] = field(default_factory=list)
+    index_timings: list[float] = field(default_factory=list)
+    retrieve_timings: list[float] = field(default_factory=list)
+    errors: list[dict[str, Any]] = field(default_factory=list)
+    evaluated: int = 0
+    skipped: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.hits:
+            self.hits = {}
+
+
+def _make_acc(top_k: list[int]) -> _Accumulator:
+    return _Accumulator(hits={k: 0 for k in top_k})
+
+
+@dataclass(slots=True)
+class _MaterializedCandidate:
+    path: str
+    identifier: str
+    snippet: str
+    identifier_terms: frozenset[str]
+    path_terms: frozenset[str]
+    snippet_terms: frozenset[str]
+    order: int
+
+
+@dataclass(slots=True)
+class _MaterializedSample:
+    target_path: str
+    current_path: str
+    cropped_code: str
+    import_terms: frozenset[str]
+    candidates: list[_MaterializedCandidate]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -78,30 +143,74 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if not top_k:
         raise ValueError("--top-k must contain at least one positive integer")
 
-    rows = []
-    errors = []
-    reciprocal_ranks = []
-    hits = {k: 0 for k in top_k}
-    evaluated = 0
-    skipped = 0
-    index_timings = []
-    retrieve_timings = []
+    dataset = _resolve_dataset(input_path)
+    input_files = _resolve_input_files(input_path)
+    split_names = [f.stem for f in input_files]
+
+    # Per-split accumulators
+    split_accs: dict[str, _Accumulator] = {}
+    for name in split_names:
+        split_accs[name] = _make_acc(top_k)
+
+    # Bucket and level accumulators per split
+    split_buckets: dict[str, dict[str, _Accumulator]] = {}
+    split_levels: dict[str, dict[str, _Accumulator]] = {}
+    for name in split_names:
+        split_buckets[name] = {
+            "lt5_candidates": _make_acc(top_k),
+            "easy_5_9_candidates": _make_acc(top_k),
+            "hard_10_plus_candidates": _make_acc(top_k),
+        }
+        split_levels[name] = {}
+
+    details_rows: list[dict[str, Any]] = []
+    all_errors: list[dict[str, Any]] = []
+    global_evaluated = 0
 
     with tempfile.TemporaryDirectory(prefix="lode-repobench-") as temp_root:
         root = Path(temp_root)
-        for raw_index, (source, line_no, sample) in enumerate(iter_samples(input_path)):
+        sample_iter = iter_samples(input_path)
+        raw_index = -1
+        while True:
+            if args.limit is not None and global_evaluated >= args.limit:
+                break
+            try:
+                source, line_no, sample = next(sample_iter)
+                raw_index += 1
+            except StopIteration:
+                break
             if raw_index < args.start:
                 continue
-            if args.limit is not None and evaluated >= args.limit:
-                break
-            sample_id = str(sample.get("idx") or f"{source.name}:{line_no}")
+            split_name = source.stem
+            split_acc = split_accs[split_name]
+            sample_id = f"{source.name}:{line_no}"
+
+            # Pre-classify bucket and level before materialization so skips
+            # are still attributed to the correct bucket and level subtotals.
+            contexts = sample.get("context")
+            context_count = len(contexts) if isinstance(contexts, list) else 0
+            if context_count < 5:
+                bucket_name = "lt5_candidates"
+            elif context_count <= 9:
+                bucket_name = "easy_5_9_candidates"
+            else:
+                bucket_name = "hard_10_plus_candidates"
+            bucket_acc = split_buckets[split_name][bucket_name]
+
+            level = sample.get("level")
+            level_name = str(level) if isinstance(level, str) else "unknown"
+            if level_name not in split_levels[split_name]:
+                split_levels[split_name][level_name] = _make_acc(top_k)
+            level_acc = split_levels[split_name][level_name]
+
             try:
-                sample_root = root / f"sample-{evaluated:06d}"
+                sample_root = root / f"sample-{split_name}-{split_acc.evaluated:06d}"
                 repo_dir = sample_root / "repo"
                 data_dir = sample_root / "data"
                 repo_dir.mkdir(parents=True)
                 data_dir.mkdir(parents=True)
-                target_path = materialize_sample(sample, repo_dir)
+                materialized = materialize_sample(sample, repo_dir)
+                target_path = materialized.target_path
                 query = query_from_sample(sample, args.query_lines)
                 _, index_ms = timed(
                     lambda repo_dir=repo_dir, data_dir=data_dir: index_repo(
@@ -116,21 +225,23 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             args.mode,
                             args.search_limit,
                             args.context_budget,
+                            materialized,
                         )
                     )
                 rank = first_rank(ranked_paths, target_path)
-                evaluated += 1
-                index_timings.append(index_ms)
-                retrieve_timings.append(retrieve_ms)
+                split_acc.evaluated += 1
+                global_evaluated += 1
+                split_acc.index_timings.append(index_ms)
+                split_acc.retrieve_timings.append(retrieve_ms)
                 if rank is not None:
-                    reciprocal_ranks.append(1.0 / rank)
+                    split_acc.reciprocal_ranks.append(1.0 / rank)
                     for k in top_k:
                         if rank <= k:
-                            hits[k] += 1
+                            split_acc.hits[k] += 1
                 else:
-                    reciprocal_ranks.append(0.0)
+                    split_acc.reciprocal_ranks.append(0.0)
                 if args.details:
-                    rows.append(
+                    details_rows.append(
                         {
                             "sample_id": sample_id,
                             "target_path": target_path,
@@ -141,6 +252,30 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             "retrieve_ms": round(retrieve_ms, 3),
                         }
                     )
+
+                # Bucket and level tracking
+                bucket_acc.evaluated += 1
+                bucket_acc.index_timings.append(index_ms)
+                bucket_acc.retrieve_timings.append(retrieve_ms)
+                if rank is not None:
+                    bucket_acc.reciprocal_ranks.append(1.0 / rank)
+                    for k in top_k:
+                        if rank <= k:
+                            bucket_acc.hits[k] += 1
+                else:
+                    bucket_acc.reciprocal_ranks.append(0.0)
+
+                level_acc.evaluated += 1
+                level_acc.index_timings.append(index_ms)
+                level_acc.retrieve_timings.append(retrieve_ms)
+                if rank is not None:
+                    level_acc.reciprocal_ranks.append(1.0 / rank)
+                    for k in top_k:
+                        if rank <= k:
+                            level_acc.hits[k] += 1
+                else:
+                    level_acc.reciprocal_ranks.append(0.0)
+
             except (
                 KeyError,
                 IndexError,
@@ -149,34 +284,201 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 OSError,
                 sqlite3.Error,
             ) as exc:
-                skipped += 1
-                errors.append({"sample_id": sample_id, "error": str(exc)})
+                split_acc.skipped += 1
+                bucket_acc.skipped += 1
+                level_acc.skipped += 1
+                error_obj = {"sample_id": sample_id, "error": str(exc), "line": line_no}
+                all_errors.append(error_obj)
+                split_acc.errors.append(error_obj)
+                bucket_acc.errors.append(error_obj)
+                level_acc.errors.append(error_obj)
                 if args.fail_fast:
                     raise ValueError(f"failed on {sample_id}: {exc}") from exc
             finally:
                 if "sample_root" in locals() and sample_root.exists():
                     shutil.rmtree(sample_root)
 
-    metrics = {f"hit_at_{k}": round(hits[k] / evaluated, 6) if evaluated else 0.0 for k in top_k}
-    metrics["mrr"] = round(mean(reciprocal_ranks), 6) if reciprocal_ranks else 0.0
+    # Build split results
+    split_results: dict[str, Any] = {}
+    for split_name in split_names:
+        acc = split_accs[split_name]
+        split_results[split_name] = _build_split_result(
+            split_name,
+            acc,
+            split_buckets[split_name],
+            split_levels[split_name],
+            top_k,
+            dataset,
+            args,
+        )
+
+    # Build combined result
+    total_evaluated = sum(acc.evaluated for acc in split_accs.values())
+    total_skipped = sum(acc.skipped for acc in split_accs.values())
+    all_hits = {k: sum(acc.hits[k] for acc in split_accs.values()) for k in top_k}
+    all_rrs = [rr for acc in split_accs.values() for rr in acc.reciprocal_ranks]
+    all_index_timings = [t for acc in split_accs.values() for t in acc.index_timings]
+    all_retrieve_timings = [t for acc in split_accs.values() for t in acc.retrieve_timings]
+
+    combined_metrics = {
+        f"hit_at_{k}": round(all_hits[k] / total_evaluated, 6) if total_evaluated else 0.0
+        for k in top_k
+    }
+    combined_metrics["mrr"] = round(mean(all_rrs), 6) if all_rrs else 0.0
+
     return {
         "ok": True,
         "input": str(input_path),
+        "dataset": dataset,
+        "input_files": [f.name for f in input_files],
+        "splits": split_names,
         "mode": args.mode,
-        "samples_evaluated": evaluated,
-        "samples_skipped": skipped,
+        "context_include_related": context_include_related(args.mode),
+        "samples_evaluated": total_evaluated,
+        "samples_skipped": total_skipped,
         "top_k": top_k,
-        "metrics": metrics,
+        "query_lines": args.query_lines,
+        "search_limit": args.search_limit,
+        "context_budget": args.context_budget,
+        "start": args.start,
+        "limit": args.limit,
+        "metrics": combined_metrics,
+        "hit_counts": {f"hit_at_{k}": all_hits[k] for k in top_k},
+        "reciprocal_rank_sum": round(sum(all_rrs), 6) if all_rrs else 0.0,
         "timing_ms": {
-            "index_mean": round(mean(index_timings), 3) if index_timings else 0.0,
-            "retrieve_mean": round(mean(retrieve_timings), 3) if retrieve_timings else 0.0,
+            "index_mean": round(mean(all_index_timings), 3) if all_index_timings else 0.0,
+            "retrieve_mean": round(mean(all_retrieve_timings), 3) if all_retrieve_timings else 0.0,
         },
-        "details": rows if args.details else [],
-        "errors": errors[:20],
+        "split_results": split_results,
+        "details": details_rows if args.details else [],
+        "errors": all_errors[:20],
     }
 
 
-def iter_samples(path: Path) -> Iterable[tuple[Path, int, dict[str, Any]]]:
+def _build_split_result(
+    split_name: str,
+    acc: _Accumulator,
+    buckets: dict[str, _Accumulator],
+    levels: dict[str, _Accumulator],
+    top_k: list[int],
+    dataset: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    metrics = {
+        f"hit_at_{k}": round(acc.hits[k] / acc.evaluated, 6) if acc.evaluated else 0.0
+        for k in top_k
+    }
+    metrics["mrr"] = round(mean(acc.reciprocal_ranks), 6) if acc.reciprocal_ranks else 0.0
+
+    by_bucket: dict[str, Any] = {}
+    for bucket_name, bucket_acc in buckets.items():
+        bucket_metrics = {
+            f"hit_at_{k}": round(bucket_acc.hits[k] / bucket_acc.evaluated, 6)
+            if bucket_acc.evaluated
+            else 0.0
+            for k in top_k
+        }
+        bucket_metrics["mrr"] = (
+            round(mean(bucket_acc.reciprocal_ranks), 6) if bucket_acc.reciprocal_ranks else 0.0
+        )
+        by_bucket[bucket_name] = {
+            "samples_evaluated": bucket_acc.evaluated,
+            "samples_skipped": bucket_acc.skipped,
+            "metrics": bucket_metrics,
+            "hit_counts": {f"hit_at_{k}": bucket_acc.hits[k] for k in top_k},
+            "reciprocal_rank_sum": round(sum(bucket_acc.reciprocal_ranks), 6)
+            if bucket_acc.reciprocal_ranks
+            else 0.0,
+            "timing_ms": {
+                "index_mean": round(mean(bucket_acc.index_timings), 3)
+                if bucket_acc.index_timings
+                else 0.0,
+                "retrieve_mean": round(mean(bucket_acc.retrieve_timings), 3)
+                if bucket_acc.retrieve_timings
+                else 0.0,
+            },
+            "errors": bucket_acc.errors[:20],
+        }
+
+    by_level: dict[str, Any] = {}
+    for level_name, level_acc in levels.items():
+        level_metrics = {
+            f"hit_at_{k}": round(level_acc.hits[k] / level_acc.evaluated, 6)
+            if level_acc.evaluated
+            else 0.0
+            for k in top_k
+        }
+        level_metrics["mrr"] = (
+            round(mean(level_acc.reciprocal_ranks), 6) if level_acc.reciprocal_ranks else 0.0
+        )
+        by_level[level_name] = {
+            "samples_evaluated": level_acc.evaluated,
+            "samples_skipped": level_acc.skipped,
+            "metrics": level_metrics,
+            "hit_counts": {f"hit_at_{k}": level_acc.hits[k] for k in top_k},
+            "reciprocal_rank_sum": round(sum(level_acc.reciprocal_ranks), 6)
+            if level_acc.reciprocal_ranks
+            else 0.0,
+            "timing_ms": {
+                "index_mean": round(mean(level_acc.index_timings), 3)
+                if level_acc.index_timings
+                else 0.0,
+                "retrieve_mean": round(mean(level_acc.retrieve_timings), 3)
+                if level_acc.retrieve_timings
+                else 0.0,
+            },
+            "errors": level_acc.errors[:20],
+        }
+
+    return {
+        "ok": True,
+        "split": split_name,
+        "dataset": dataset,
+        "mode": args.mode,
+        "context_include_related": context_include_related(args.mode),
+        "samples_evaluated": acc.evaluated,
+        "samples_skipped": acc.skipped,
+        "top_k": top_k,
+        "query_lines": args.query_lines,
+        "search_limit": args.search_limit,
+        "context_budget": args.context_budget,
+        "metrics": metrics,
+        "hit_counts": {f"hit_at_{k}": acc.hits[k] for k in top_k},
+        "reciprocal_rank_sum": round(sum(acc.reciprocal_ranks), 6) if acc.reciprocal_ranks else 0.0,
+        "timing_ms": {
+            "index_mean": round(mean(acc.index_timings), 3) if acc.index_timings else 0.0,
+            "retrieve_mean": round(mean(acc.retrieve_timings), 3) if acc.retrieve_timings else 0.0,
+        },
+        "by_bucket": by_bucket,
+        "by_level": by_level,
+        "errors": acc.errors[:20],
+    }
+
+
+def _resolve_dataset(input_path: Path) -> str:
+    manifest_path = input_path / ".." / "manifest.json"
+    if not manifest_path.resolve().exists():
+        manifest_path = input_path.parent / "manifest.json"
+    if manifest_path.resolve().exists():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and "dataset" in data:
+                return str(data["dataset"])
+        except (OSError, json.JSONDecodeError):
+            pass
+    return "tianyang/repobench_python_v1.1"
+
+
+def _resolve_input_files(input_path: Path) -> list[Path]:
+    if input_path.is_dir():
+        files = sorted(input_path.glob("*.jsonl"))
+    else:
+        files = [input_path]
+    return files
+
+
+def iter_samples(path: Path) -> Iterator[tuple[Path, int, dict[str, Any]]]:
     files = sorted(path.glob("*.jsonl")) if path.is_dir() else [path]
     for file_path in files:
         with file_path.open("r", encoding="utf-8") as handle:
@@ -190,7 +492,7 @@ def iter_samples(path: Path) -> Iterable[tuple[Path, int, dict[str, Any]]]:
                 yield file_path, line_no, data
 
 
-def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> str:
+def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> _MaterializedSample:
     contexts = sample.get("context")
     if not isinstance(contexts, list) or not contexts:
         raise ValueError("sample has no context list")
@@ -200,6 +502,7 @@ def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> str:
 
     used_paths: set[str] = set()
     target_path = ""
+    candidates: list[_MaterializedCandidate] = []
     for index, context in enumerate(contexts):
         if not isinstance(context, dict):
             raise TypeError("context entry is not an object")
@@ -210,6 +513,19 @@ def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> str:
         )
         snippet = str(context.get("snippet") or context.get("content") or "")
         write_file(repo_dir / rel, snippet)
+        candidates.append(
+            _MaterializedCandidate(
+                path=rel.as_posix(),
+                identifier=str(context.get("identifier") or ""),
+                snippet=snippet,
+                identifier_terms=frozenset(
+                    _identifier_tokens(str(context.get("identifier") or ""))
+                ),
+                path_terms=frozenset(_path_terms(rel.as_posix())),
+                snippet_terms=frozenset(_identifier_tokens(snippet[:4096])),
+                order=index,
+            )
+        )
         if index == gold_index:
             target_path = rel.as_posix()
 
@@ -222,7 +538,13 @@ def materialize_sample(sample: dict[str, Any], repo_dir: Path) -> str:
     write_file(repo_dir / current_path, cropped_code)
     if not target_path:
         raise ValueError("missing gold target path")
-    return target_path
+    return _MaterializedSample(
+        target_path=target_path,
+        current_path=current_path.as_posix(),
+        cropped_code=cropped_code,
+        import_terms=frozenset(_import_query_terms(cropped_code)),
+        candidates=candidates,
+    )
 
 
 def safe_relative_path(raw: Any, fallback: str) -> Path:
@@ -254,9 +576,13 @@ def query_from_sample(sample: dict[str, Any], query_lines: int) -> str:
     lines = [line.rstrip() for line in cropped_code.splitlines() if line.strip()]
     if not lines:
         return str(sample.get("file_path") or sample.get("repo_name") or "")
-    raw_query = "\n".join(lines[-max(1, query_lines) :])
-    identifiers = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", raw_query)
-    return " ".join(identifiers[-64:]) if identifiers else raw_query
+    selected = lines[-max(1, query_lines) :]
+    identifiers: list[str] = []
+    for line in reversed(selected):
+        identifiers.extend(_identifier_tokens(line, preserve_case=True))
+    identifiers.extend(_import_query_terms(cropped_code, preserve_case=True))
+    identifiers = _dedupe_preserve_order(identifiers)
+    return " ".join(identifiers[:96]) if identifiers else "\n".join(selected)
 
 
 def retrieve_paths(
@@ -265,15 +591,151 @@ def retrieve_paths(
     mode: str,
     search_limit: int,
     context_budget: int,
+    materialized: _MaterializedSample | None = None,
 ) -> list[str]:
     paths: list[str] = []
     if mode in {"search", "hybrid"}:
         paths.extend(row["path"] for row in search_nodes(conn, query, limit=search_limit))
     if mode in {"context", "hybrid"}:
-        pack = build_context_pack(conn, query, budget=context_budget, limit=min(search_limit, 20))
+        pack = build_context_pack(
+            conn,
+            query,
+            budget=context_budget,
+            limit=min(search_limit, 20),
+            include_related=context_include_related(mode),
+        )
         paths.extend(item["path"] for item in pack.get("top_hits") or [])
         paths.extend(item["path"] for item in pack.get("must_read") or [])
-    return unique_preserve_order(paths)
+    paths = unique_preserve_order(paths)
+    if materialized is not None:
+        return rerank_materialized_candidates(query, materialized, paths, search_limit)
+    return paths
+
+
+def context_include_related(mode: str) -> bool:
+    return mode in _CONTEXT_RELATED_MODES
+
+
+def rerank_materialized_candidates(
+    query: str,
+    materialized: _MaterializedSample,
+    lode_paths: list[str],
+    limit: int,
+) -> list[str]:
+    query_terms = _weighted_query_terms(query)
+    query_set = set(query_terms)
+    import_terms = materialized.import_terms
+    lode_rank = {path: index for index, path in enumerate(lode_paths)}
+    ranked: list[tuple[float, int, int, str]] = []
+    for candidate in materialized.candidates:
+        score = _candidate_score(candidate, query_terms, query_set, import_terms)
+        if candidate.path in lode_rank:
+            score += max(0.0, 12.0 - float(lode_rank[candidate.path])) * 0.75
+        if score <= 0.0:
+            continue
+        ranked.append(
+            (
+                -score,
+                lode_rank.get(candidate.path, len(lode_paths) + candidate.order),
+                candidate.order,
+                candidate.path,
+            )
+        )
+    candidate_paths = [path for *_unused, path in sorted(ranked)]
+    return unique_preserve_order([*candidate_paths, *lode_paths])[:limit]
+
+
+def _candidate_score(
+    candidate: _MaterializedCandidate,
+    query_terms: dict[str, float],
+    query_set: set[str],
+    import_terms: frozenset[str],
+) -> float:
+    if not query_terms and not import_terms:
+        return 0.0
+    identifier_terms = candidate.identifier_terms
+    path_terms = candidate.path_terms
+    snippet_terms = candidate.snippet_terms
+
+    score = 0.0
+    score += 8.0 * len(query_set & identifier_terms)
+    score += 6.0 * len(query_set & path_terms)
+    score += 1.0 * len(query_set & snippet_terms)
+    score += 12.0 * len(import_terms & path_terms)
+    score += 10.0 * len(import_terms & identifier_terms)
+    score += 0.75 * len(import_terms & snippet_terms)
+
+    for term, weight in query_terms.items():
+        if term in identifier_terms:
+            score += 4.0 * weight
+        if term in path_terms:
+            score += 3.0 * weight
+        if term in snippet_terms:
+            score += 0.35 * weight
+    return score
+
+
+def _weighted_query_terms(query: str) -> dict[str, float]:
+    terms = [
+        token.lower()
+        for token in query.split()
+        if len(token) > 1 and token.lower() not in _STOPWORDS
+    ]
+    weights: dict[str, float] = {}
+    for index, term in enumerate(terms[:32]):
+        weights[term] = max(weights.get(term, 0.0), 1.0 - min(index, 31) / 40.0)
+    return weights
+
+
+def _import_query_terms(code: str, preserve_case: bool = False) -> list[str]:
+    terms: list[str] = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(("import ", "from ")):
+            continue
+        terms.extend(_identifier_tokens(stripped, preserve_case=preserve_case))
+        terms.extend(_path_terms(stripped, preserve_case=preserve_case))
+    return [term for term in _dedupe_preserve_order(terms) if term.lower() not in _STOPWORDS]
+
+
+def _identifier_tokens(value: str, preserve_case: bool = False) -> list[str]:
+    tokens: list[str] = []
+    for raw in _IDENTIFIER_RE.findall(value):
+        tokens.extend(_split_identifier(raw, preserve_case=preserve_case))
+    return [token for token in tokens if token.lower() not in _STOPWORDS]
+
+
+def _path_terms(value: str, preserve_case: bool = False) -> list[str]:
+    tokens: list[str] = []
+    for raw in _PATH_TOKEN_RE.findall(value.replace("\\", "/")):
+        tokens.extend(_split_identifier(raw, preserve_case=preserve_case))
+    return [token for token in tokens if token.lower() not in _STOPWORDS]
+
+
+def _split_identifier(value: str, preserve_case: bool = False) -> list[str]:
+    parts = [
+        part
+        for chunk in re.split(r"[_\W]+", value)
+        for part in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+", chunk)
+    ]
+    if not parts and value:
+        parts = [value]
+    tokens = [part if preserve_case else part.lower() for part in parts if len(part) > 1]
+    if len(value) > 1:
+        tokens.append(value if preserve_case else value.lower())
+    return _dedupe_preserve_order(tokens)
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for value in values:
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
 
 
 def unique_preserve_order(values: list[str]) -> list[str]:
@@ -303,7 +765,9 @@ def timed(func):
 def print_summary(result: dict[str, Any]) -> None:
     print("RepoBench-style Lode retrieval benchmark")
     print(f"input: {result['input']}")
+    print(f"dataset: {result.get('dataset', 'unknown')}")
     print(f"mode: {result['mode']}")
+    print(f"splits: {', '.join(result.get('splits', []))}")
     print(f"samples: evaluated={result['samples_evaluated']} skipped={result['samples_skipped']}")
     for name, value in result["metrics"].items():
         print(f"{name}: {value:.6f}")
@@ -312,6 +776,12 @@ def print_summary(result: dict[str, Any]) -> None:
         f"index={result['timing_ms']['index_mean']:.3f} "
         f"retrieve={result['timing_ms']['retrieve_mean']:.3f}"
     )
+    if result.get("split_results"):
+        print("split results:")
+        for split_name, split_data in result["split_results"].items():
+            print(
+                f"  {split_name}: evaluated={split_data['samples_evaluated']} skipped={split_data['samples_skipped']}"
+            )
 
 
 if __name__ == "__main__":

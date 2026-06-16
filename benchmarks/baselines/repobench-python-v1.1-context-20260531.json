@@ -1,0 +1,560 @@
+{
+  "context_budget": 6000,
+  "dataset": "tianyang/repobench_python_v1.1",
+  "metrics": {
+    "hit_at_1": 0.162893,
+    "hit_at_10": 0.568879,
+    "hit_at_3": 0.400294,
+    "hit_at_5": 0.501471,
+    "mrr": 0.299418
+  },
+  "mode": "context",
+  "ok": true,
+  "query_lines": 5,
+  "samples_evaluated": 15636,
+  "samples_skipped": 15,
+  "search_limit": 30,
+  "split_results": {
+    "cross_file_first": {
+      "by_bucket": {
+        "easy_5_9_candidates": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.12859,
+            "hit_at_10": 0.625375,
+            "hit_at_3": 0.383198,
+            "hit_at_5": 0.552079,
+            "mrr": 0.286898
+          },
+          "samples_evaluated": 2333,
+          "samples_skipped": 1,
+          "timing_ms": {
+            "index_mean": 20.157,
+            "retrieve_mean": 1.833
+          }
+        },
+        "hard_10_plus_candidates": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.085787,
+            "hit_at_10": 0.476501,
+            "hit_at_3": 0.236976,
+            "hit_at_5": 0.349377,
+            "mrr": 0.195167
+          },
+          "samples_evaluated": 3532,
+          "samples_skipped": 0,
+          "timing_ms": {
+            "index_mean": 37.164,
+            "retrieve_mean": 2.275
+          }
+        },
+        "lt5_candidates": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.203147,
+            "hit_at_10": 0.645072,
+            "hit_at_3": 0.584914,
+            "hit_at_5": 0.645072,
+            "mrr": 0.384567
+          },
+          "samples_evaluated": 2161,
+          "samples_skipped": 6,
+          "timing_ms": {
+            "index_mean": 9.625,
+            "retrieve_mean": 1.27
+          }
+        }
+      },
+      "by_level": {
+        "128k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.173554,
+            "hit_at_10": 0.421488,
+            "hit_at_3": 0.355372,
+            "hit_at_5": 0.371901,
+            "mrr": 0.257051
+          },
+          "samples_evaluated": 121,
+          "samples_skipped": 0,
+          "timing_ms": {
+            "index_mean": 120.225,
+            "retrieve_mean": 4.164
+          }
+        },
+        "12k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.15015,
+            "hit_at_10": 0.61962,
+            "hit_at_3": 0.415415,
+            "hit_at_5": 0.538539,
+            "mrr": 0.305312
+          },
+          "samples_evaluated": 999,
+          "samples_skipped": 1,
+          "timing_ms": {
+            "index_mean": 16.643,
+            "retrieve_mean": 1.809
+          }
+        },
+        "16k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.118236,
+            "hit_at_10": 0.596192,
+            "hit_at_3": 0.374749,
+            "hit_at_5": 0.480962,
+            "mrr": 0.271194
+          },
+          "samples_evaluated": 998,
+          "samples_skipped": 2,
+          "timing_ms": {
+            "index_mean": 22.506,
+            "retrieve_mean": 1.987
+          }
+        },
+        "24k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.104,
+            "hit_at_10": 0.569,
+            "hit_at_3": 0.317,
+            "hit_at_5": 0.448,
+            "mrr": 0.241536
+          },
+          "samples_evaluated": 1000,
+          "samples_skipped": 0,
+          "timing_ms": {
+            "index_mean": 30.793,
+            "retrieve_mean": 2.219
+          }
+        },
+        "2k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.138,
+            "hit_at_10": 0.539,
+            "hit_at_3": 0.45,
+            "hit_at_5": 0.531,
+            "mrr": 0.29503
+          },
+          "samples_evaluated": 1000,
+          "samples_skipped": 0,
+          "timing_ms": {
+            "index_mean": 4.564,
+            "retrieve_mean": 0.992
+          }
+        },
+        "32k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.093093,
+            "hit_at_10": 0.497497,
+            "hit_at_3": 0.256256,
+            "hit_at_5": 0.384384,
+            "mrr": 0.209835
+          },
+          "samples_evaluated": 999,
+          "samples_skipped": 1,
+          "timing_ms": {
+            "index_mean": 40.687,
+            "retrieve_mean": 2.36
+          }
+        },
+        "4k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.151303,
+            "hit_at_10": 0.598196,
+            "hit_at_3": 0.455912,
+            "hit_at_5": 0.568136,
+            "mrr": 0.313856
+          },
+          "samples_evaluated": 998,
+          "samples_skipped": 2,
+          "timing_ms": {
+            "index_mean": 6.652,
+            "retrieve_mean": 1.224
+          }
+        },
+        "64k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.115258,
+            "hit_at_10": 0.500549,
+            "hit_at_3": 0.263447,
+            "hit_at_5": 0.399561,
+            "mrr": 0.223782
+          },
+          "samples_evaluated": 911,
+          "samples_skipped": 1,
+          "timing_ms": {
+            "index_mean": 57.674,
+            "retrieve_mean": 2.746
+          }
+        },
+        "8k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.162,
+            "hit_at_10": 0.613,
+            "hit_at_3": 0.445,
+            "hit_at_5": 0.559,
+            "mrr": 0.319668
+          },
+          "samples_evaluated": 1000,
+          "samples_skipped": 0,
+          "timing_ms": {
+            "index_mean": 10.269,
+            "retrieve_mean": 1.474
+          }
+        }
+      },
+      "context_budget": 6000,
+      "dataset": "tianyang/repobench_python_v1.1",
+      "errors": [
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 1253,
+          "sample_id": "cross_file_first.jsonl:1253"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 1656,
+          "sample_id": "cross_file_first.jsonl:1656"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 3244,
+          "sample_id": "cross_file_first.jsonl:3244"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 4539,
+          "sample_id": "cross_file_first.jsonl:4539"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 4786,
+          "sample_id": "cross_file_first.jsonl:4786"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 6063,
+          "sample_id": "cross_file_first.jsonl:6063"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 7842,
+          "sample_id": "cross_file_first.jsonl:7842"
+        }
+      ],
+      "metrics": {
+        "hit_at_1": 0.129828,
+        "hit_at_10": 0.565163,
+        "hit_at_3": 0.373162,
+        "hit_at_5": 0.487914,
+        "mrr": 0.272828
+      },
+      "mode": "context",
+      "ok": true,
+      "query_lines": 5,
+      "samples_evaluated": 8026,
+      "samples_skipped": 7,
+      "search_limit": 30,
+      "split": "cross_file_first",
+      "timing_ms": {
+        "index_mean": 24.805,
+        "retrieve_mean": 1.876
+      },
+      "top_k": [
+        1,
+        3,
+        5,
+        10
+      ]
+    },
+    "cross_file_random": {
+      "by_bucket": {
+        "easy_5_9_candidates": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.216931,
+            "hit_at_10": 0.622896,
+            "hit_at_3": 0.453102,
+            "hit_at_5": 0.580568,
+            "mrr": 0.354759
+          },
+          "samples_evaluated": 2079,
+          "samples_skipped": 3,
+          "timing_ms": {
+            "index_mean": 17.309,
+            "retrieve_mean": 1.771
+          }
+        },
+        "hard_10_plus_candidates": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.137821,
+            "hit_at_10": 0.496677,
+            "hit_at_3": 0.299913,
+            "hit_at_5": 0.396706,
+            "mrr": 0.244863
+          },
+          "samples_evaluated": 3461,
+          "samples_skipped": 0,
+          "timing_ms": {
+            "index_mean": 32.996,
+            "retrieve_mean": 2.139
+          }
+        },
+        "lt5_candidates": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.278744,
+            "hit_at_10": 0.649758,
+            "hit_at_3": 0.62029,
+            "hit_at_5": 0.649758,
+            "mrr": 0.438148
+          },
+          "samples_evaluated": 2070,
+          "samples_skipped": 5,
+          "timing_ms": {
+            "index_mean": 8.438,
+            "retrieve_mean": 1.249
+          }
+        }
+      },
+      "by_level": {
+        "128k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.191176,
+            "hit_at_10": 0.705882,
+            "hit_at_3": 0.514706,
+            "hit_at_5": 0.647059,
+            "mrr": 0.377019
+          },
+          "samples_evaluated": 68,
+          "samples_skipped": 0,
+          "timing_ms": {
+            "index_mean": 108.072,
+            "retrieve_mean": 3.919
+          }
+        },
+        "12k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.22022,
+            "hit_at_10": 0.632633,
+            "hit_at_3": 0.456456,
+            "hit_at_5": 0.574575,
+            "mrr": 0.358555
+          },
+          "samples_evaluated": 999,
+          "samples_skipped": 1,
+          "timing_ms": {
+            "index_mean": 16.434,
+            "retrieve_mean": 1.827
+          }
+        },
+        "16k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.164493,
+            "hit_at_10": 0.587763,
+            "hit_at_3": 0.374122,
+            "hit_at_5": 0.48345,
+            "mrr": 0.297881
+          },
+          "samples_evaluated": 997,
+          "samples_skipped": 3,
+          "timing_ms": {
+            "index_mean": 22.726,
+            "retrieve_mean": 1.975
+          }
+        },
+        "24k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.159159,
+            "hit_at_10": 0.523524,
+            "hit_at_3": 0.337337,
+            "hit_at_5": 0.427427,
+            "mrr": 0.270003
+          },
+          "samples_evaluated": 999,
+          "samples_skipped": 1,
+          "timing_ms": {
+            "index_mean": 30.675,
+            "retrieve_mean": 2.2
+          }
+        },
+        "2k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.236,
+            "hit_at_10": 0.596,
+            "hit_at_3": 0.558,
+            "hit_at_5": 0.595,
+            "mrr": 0.387343
+          },
+          "samples_evaluated": 1000,
+          "samples_skipped": 0,
+          "timing_ms": {
+            "index_mean": 5.184,
+            "retrieve_mean": 1.138
+          }
+        },
+        "32k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.12766,
+            "hit_at_10": 0.456383,
+            "hit_at_3": 0.289362,
+            "hit_at_5": 0.376596,
+            "mrr": 0.22819
+          },
+          "samples_evaluated": 940,
+          "samples_skipped": 0,
+          "timing_ms": {
+            "index_mean": 37.422,
+            "retrieve_mean": 2.188
+          }
+        },
+        "4k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.267,
+            "hit_at_10": 0.613,
+            "hit_at_3": 0.522,
+            "hit_at_5": 0.59,
+            "mrr": 0.399433
+          },
+          "samples_evaluated": 1000,
+          "samples_skipped": 0,
+          "timing_ms": {
+            "index_mean": 6.228,
+            "retrieve_mean": 1.16
+          }
+        },
+        "64k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.174342,
+            "hit_at_10": 0.506579,
+            "hit_at_3": 0.338816,
+            "hit_at_5": 0.432566,
+            "mrr": 0.280761
+          },
+          "samples_evaluated": 608,
+          "samples_skipped": 2,
+          "timing_ms": {
+            "index_mean": 56.01,
+            "retrieve_mean": 2.601
+          }
+        },
+        "8k": {
+          "errors": [],
+          "metrics": {
+            "hit_at_1": 0.22022,
+            "hit_at_10": 0.624625,
+            "hit_at_3": 0.505506,
+            "hit_at_5": 0.596597,
+            "mrr": 0.369819
+          },
+          "samples_evaluated": 999,
+          "samples_skipped": 1,
+          "timing_ms": {
+            "index_mean": 9.946,
+            "retrieve_mean": 1.475
+          }
+        }
+      },
+      "context_budget": 6000,
+      "dataset": "tianyang/repobench_python_v1.1",
+      "errors": [
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 2369,
+          "sample_id": "cross_file_random.jsonl:2369"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 3151,
+          "sample_id": "cross_file_random.jsonl:3151"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 4167,
+          "sample_id": "cross_file_random.jsonl:4167"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 4187,
+          "sample_id": "cross_file_random.jsonl:4187"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 4675,
+          "sample_id": "cross_file_random.jsonl:4675"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 5937,
+          "sample_id": "cross_file_random.jsonl:5937"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 7252,
+          "sample_id": "cross_file_random.jsonl:7252"
+        },
+        {
+          "error": "IndexError('gold_snippet_index is outside context list')",
+          "line": 7470,
+          "sample_id": "cross_file_random.jsonl:7470"
+        }
+      ],
+      "metrics": {
+        "hit_at_1": 0.197766,
+        "hit_at_10": 0.572799,
+        "hit_at_3": 0.428909,
+        "hit_at_5": 0.515769,
+        "mrr": 0.327461
+      },
+      "mode": "context",
+      "ok": true,
+      "query_lines": 5,
+      "samples_evaluated": 7610,
+      "samples_skipped": 8,
+      "search_limit": 30,
+      "split": "cross_file_random",
+      "timing_ms": {
+        "index_mean": 22.03,
+        "retrieve_mean": 1.796
+      },
+      "top_k": [
+        1,
+        3,
+        5,
+        10
+      ]
+    }
+  },
+  "splits": [
+    "cross_file_first",
+    "cross_file_random"
+  ],
+  "timing_ms": {
+    "index_mean": 23.454,
+    "retrieve_mean": 1.837
+  },
+  "top_k": [
+    1,
+    3,
+    5,
+    10
+  ]
+}

@@ -201,14 +201,14 @@ better in the benchmark data I checked.
 
 ## Benchmarks
 
-Latest local run: 2026-05-31 on an AMD Ryzen 9 8945HS, 16 logical cores, Python
-3.13.9. Raw artifacts are under ignored `bench-results/20260531T184011Z/`. The
-numbers to watch are the SQLite hot-path timings; that is what an agent uses
-inside a normal turn. Kuzu sync is a batch/analytics projection.
+Final gate run: 2026-06-16 on an AMD Ryzen 9 8945HS, 16 logical cores, Python
+3.13.9. The final evidence passed 78/78 validation assertions. The numbers to
+watch are the SQLite hot-path timings; that is what an agent uses inside a
+normal turn. Kuzu sync is a batch/analytics projection.
 
 | Workload | Files | Nodes | Edges | Cold index | Hot re-index | Search p50 | Symbol p50 | Context p50 | Neighbor p50 | Kuzu sync | Embeddings |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Lode repo | 19 | 814 | 1,166 | 161.970 ms | 9.866 ms | 0.348 ms | 0.491 ms | 2.038 ms | 0.457 ms | 8,587.591 ms | 32 @ 24.3/s, 384d |
+| Lode repo | 47 | 2,358 | 5,112 | 154.391 ms | 2.896 ms | 0.267 ms | 0.064 ms | 0.346 ms | 0.402 ms | 213.744 ms | 32 @ 31.655/s, 384d |
 | Medium app | 383 | 4,817 | 4,573 | 2,505.509 ms | 43.303 ms | 1.742 ms | 4.187 ms | 6.717 ms | 1.162 ms | 41,702.766 ms | 32 @ 33.5/s, 384d |
 | Larger app SQLite hot path | 1,270 | 15,846 | 15,453 | 17,342.433 ms | 95.348 ms | 14.359 ms | 15.739 ms | 34.076 ms | 3.437 ms | n/a | n/a |
 
@@ -218,15 +218,15 @@ The run uses `context` mode, `--query-lines 5`, `--search-limit 30`,
 `--context-budget 6000`, and reports retrieval only: did Lode rank the gold
 cross-file snippet path high enough? It does not score code generation.
 
-Raw artifacts are under ignored
-`bench-results/20260531T203339Z-full-repobench-r/`. Fifteen rows were skipped
-because `gold_snippet_index` pointed outside the provided context list.
+Final gate artifacts were preserved in the mission evidence bundle. Fifteen rows
+were skipped because `gold_snippet_index` pointed outside the provided context
+list.
 
 | Split | Samples | Skipped | Mean retrieval | Hit@1 | Hit@3 | Hit@5 | Hit@10 | MRR |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `cross_file_first` | 8,026 | 7 | 1.876 ms | 0.129828 | 0.373162 | 0.487914 | 0.565163 | 0.272828 |
-| `cross_file_random` | 7,610 | 8 | 1.796 ms | 0.197766 | 0.428909 | 0.515769 | 0.572799 | 0.327461 |
-| Combined | 15,636 | 15 | 1.837 ms | 0.162893 | 0.400294 | 0.501471 | 0.568879 | 0.299418 |
+| `cross_file_first` | 8,026 | 7 | 0.858 ms | 0.250436 | 0.596935 | 0.730002 | 0.843633 | 0.451728 |
+| `cross_file_random` | 7,610 | 8 | 0.869 ms | 0.368725 | 0.645466 | 0.753876 | 0.854271 | 0.532594 |
+| Combined | 15,636 | 15 | 0.863 ms | 0.308007 | 0.620555 | 0.741622 | 0.848810 | 0.491085 |
 
 [RepoBench](https://openreview.net/forum?id=pPjZIOuQuF) is an ICLR 2024 benchmark
 for repository-level code completion. I did not find an official v1.1
@@ -261,6 +261,14 @@ uv run python benchmarks/repobench_adapter.py --input repobench_cross_file_first
 The adapter turns each sample into a tiny repository, then reports `hit_at_k` and
 MRR for the gold cross-file snippet path. It is a retrieval benchmark, not a
 code-generation benchmark.
+
+Run the full end-of-mission gate for quality checks, local-first assertions,
+benchmark comparison, Kuzu and embeddings validation, RepoBench adapter
+diagnostics, and CLI/API compatibility assertions:
+
+```bash
+uv run python scripts/final_quality_gate.py
+```
 
 ## License
 

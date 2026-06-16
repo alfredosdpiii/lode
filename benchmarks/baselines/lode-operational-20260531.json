@@ -1,0 +1,154 @@
+{
+  "cold_index": {
+    "stats": {
+      "edges": 1571,
+      "indexed": 19,
+      "nodes": 1401,
+      "removed": 0,
+      "repo_id": "a0433fc5a9c2303b",
+      "root": "/home/bryan/Projects/lode",
+      "scanned": 19,
+      "skipped_unchanged": 0
+    },
+    "timing_ms": 161.97
+  },
+  "context": {
+    "build context pack": {
+      "confidence": "strong",
+      "must_read_count": 10,
+      "timing_ms": {
+        "count": 10,
+        "max": 2.267,
+        "mean": 2.065,
+        "min": 1.928,
+        "p50": 2.064,
+        "p95": 2.267
+      },
+      "top_hit_count": 10
+    },
+    "embedding queue": {
+      "confidence": "strong",
+      "must_read_count": 10,
+      "timing_ms": {
+        "count": 10,
+        "max": 2.292,
+        "mean": 2.004,
+        "min": 1.779,
+        "p50": 2.011,
+        "p95": 2.292
+      },
+      "top_hit_count": 10
+    }
+  },
+  "data_dir": "/home/bryan/Projects/lode/bench-results/20260531T184011Z/data/lode",
+  "database": {
+    "counts": {
+      "edges": 1166,
+      "embedding_queue": 156,
+      "embeddings": 0,
+      "files": 19,
+      "nodes": 814,
+      "repos": 1
+    },
+    "kuzu_bytes": 0,
+    "sqlite_bytes": 1081344,
+    "sqlite_shm_bytes": 32768,
+    "sqlite_wal_bytes": 0
+  },
+  "database_after_embeddings": {
+    "counts": {
+      "edges": 1166,
+      "embedding_queue": 156,
+      "embeddings": 32,
+      "files": 19,
+      "nodes": 814,
+      "repos": 1
+    },
+    "kuzu_bytes": 0,
+    "sqlite_bytes": 1081344,
+    "sqlite_shm_bytes": 32768,
+    "sqlite_wal_bytes": 721032
+  },
+  "embeddings": {
+    "dims": 384,
+    "embedded": 32,
+    "model": "Snowflake/snowflake-arctic-embed-s",
+    "queued": 124,
+    "timing_ms": 1319.155,
+    "vectors_per_second": 24.258
+  },
+  "hot_index": {
+    "stats": {
+      "edges": 0,
+      "indexed": 0,
+      "nodes": 0,
+      "removed": 0,
+      "repo_id": "a0433fc5a9c2303b",
+      "root": "/home/bryan/Projects/lode",
+      "scanned": 19,
+      "skipped_unchanged": 19
+    },
+    "timing_ms": 9.866
+  },
+  "kuzu": {
+    "edges": 1166,
+    "kuzu_path": "/home/bryan/Projects/lode/bench-results/20260531T184011Z/data/lode/lode.kuzu",
+    "nodes": 814,
+    "timing_ms": 8587.591
+  },
+  "neighbors": {
+    "incoming": 0,
+    "node_id": "e059a4946dfd2e48b38dd320",
+    "outgoing": 40,
+    "timing_ms": {
+      "count": 10,
+      "max": 0.525,
+      "mean": 0.469,
+      "min": 0.433,
+      "p50": 0.457,
+      "p95": 0.525
+    }
+  },
+  "ok": true,
+  "repo": "/home/bryan/Projects/lode",
+  "search": {
+    "build context pack": {
+      "last_result_count": 20,
+      "timing_ms": {
+        "count": 10,
+        "max": 0.978,
+        "mean": 0.447,
+        "min": 0.359,
+        "p50": 0.387,
+        "p95": 0.978
+      },
+      "top_path": "src/lode/context.py"
+    },
+    "embedding queue": {
+      "last_result_count": 20,
+      "timing_ms": {
+        "count": 10,
+        "max": 0.368,
+        "mean": 0.315,
+        "min": 0.297,
+        "p50": 0.309,
+        "p95": 0.368
+      },
+      "top_path": "src/lode/embeddings.py"
+    }
+  },
+  "symbols": {
+    "build_context_pack": {
+      "last_result_count": 6,
+      "timing_ms": {
+        "count": 10,
+        "max": 0.607,
+        "mean": 0.504,
+        "min": 0.481,
+        "p50": 0.491,
+        "p95": 0.607
+      },
+      "top_path": "src/lode/context.py"
+    }
+  }
+}

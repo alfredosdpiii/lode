@@ -4,8 +4,12 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from ipaddress import ip_address
 from typing import Any
+
+LOCAL_EMBEDDING_HOSTS = {"localhost", "embeddings"}
 
 
 def embeddings_url() -> str | None:
@@ -20,10 +24,27 @@ def embeddings_model() -> str:
     )
 
 
-def embed_texts(texts: list[str], url: str | None = None, retries: int = 2) -> list[list[float]]:
+def local_embeddings_endpoint(url: str | None = None) -> str:
     endpoint = (url or embeddings_url() or "").rstrip("/")
     if not endpoint:
         raise RuntimeError("No local embeddings endpoint configured. Set LODE_EMBEDDINGS_URL.")
+    parsed = urllib.parse.urlparse(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError("Embeddings endpoint must be a local HTTP URL.")
+    host = parsed.hostname.lower()
+    if host not in LOCAL_EMBEDDING_HOSTS:
+        try:
+            if not ip_address(host).is_loopback:
+                raise ValueError
+        except ValueError as exc:
+            raise RuntimeError(
+                "Embeddings endpoint must be local, use loopback or Docker service 'embeddings'."
+            ) from exc
+    return endpoint
+
+
+def embed_texts(texts: list[str], url: str | None = None, retries: int = 2) -> list[list[float]]:
+    endpoint = local_embeddings_endpoint(url)
     payload = json.dumps({"inputs": texts}).encode("utf-8")
     request = urllib.request.Request(
         f"{endpoint}/embed",
