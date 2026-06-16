@@ -957,20 +957,73 @@ _NEIGHBOR_ORDER_SQL = """
             ELSE n.start_line
           END
         """
-_OUTGOING_NEIGHBORS_SQL = """
-        SELECT e.kind AS edge_kind, e.confidence AS edge_confidence, e.detail, n.*, 0.0 AS rank
+_NEIGHBOR_NODE_COLUMNS_SQL = """
+               n.id, n.repo_id, n.owner_path, n.kind, n.name, n.qname, n.path,
+               n.start_line, n.end_line, n.signature, n.doc, n.confidence,
+               n.content_hash, n.extra_json, 0.0
+        """
+_OUTGOING_NEIGHBORS_SQL = (
+    """
+        SELECT e.kind, e.confidence, e.detail,
+        """
+    + _NEIGHBOR_NODE_COLUMNS_SQL
+    + """
         FROM edges e
         LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.dst
         WHERE e.repo_id = ? AND e.src = ?
         """
-_OUTGOING_NEIGHBOR_COUNT_SQL = "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND src = ?"
-_INCOMING_NEIGHBORS_SQL = """
-        SELECT e.kind AS edge_kind, e.confidence AS edge_confidence, e.detail, n.*, 0.0 AS rank
+)
+_INCOMING_NEIGHBORS_SQL = (
+    """
+        SELECT e.kind, e.confidence, e.detail,
+        """
+    + _NEIGHBOR_NODE_COLUMNS_SQL
+    + """
         FROM edges e
         LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.src
         WHERE e.repo_id = ? AND e.dst = ?
         """
-_INCOMING_NEIGHBOR_COUNT_SQL = "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND dst = ?"
+)
+_NEIGHBOR_NODE_LOOKUP_SQL = """
+        SELECT id, repo_id, owner_path, kind, name, qname, path,
+               start_line, end_line, signature, doc, confidence, content_hash,
+               extra_json, 0.0
+        FROM nodes
+        WHERE id = ?
+        """
+_NEIGHBOR_EDGE_KIND = 0
+_NEIGHBOR_EDGE_CONFIDENCE = 1
+_NEIGHBOR_EDGE_DETAIL = 2
+_NEIGHBOR_NODE_ID = 3
+_NEIGHBOR_REPO_ID = 4
+_NEIGHBOR_OWNER_PATH = 5
+_NEIGHBOR_KIND = 6
+_NEIGHBOR_NAME = 7
+_NEIGHBOR_QNAME = 8
+_NEIGHBOR_PATH = 9
+_NEIGHBOR_START_LINE = 10
+_NEIGHBOR_END_LINE = 11
+_NEIGHBOR_SIGNATURE = 12
+_NEIGHBOR_DOC = 13
+_NEIGHBOR_CONFIDENCE = 14
+_NEIGHBOR_CONTENT_HASH = 15
+_NEIGHBOR_EXTRA_JSON = 16
+_NEIGHBOR_RANK = 17
+_NODE_ROW_ID = 0
+_NODE_ROW_REPO_ID = 1
+_NODE_ROW_OWNER_PATH = 2
+_NODE_ROW_KIND = 3
+_NODE_ROW_NAME = 4
+_NODE_ROW_QNAME = 5
+_NODE_ROW_PATH = 6
+_NODE_ROW_START_LINE = 7
+_NODE_ROW_END_LINE = 8
+_NODE_ROW_SIGNATURE = 9
+_NODE_ROW_DOC = 10
+_NODE_ROW_CONFIDENCE = 11
+_NODE_ROW_CONTENT_HASH = 12
+_NODE_ROW_EXTRA_JSON = 13
+_NODE_ROW_RANK = 14
 
 
 def neighbor_sort_key(item: dict[str, Any]) -> tuple[int, int, str, int]:
@@ -984,58 +1037,109 @@ def neighbor_sort_key(item: dict[str, Any]) -> tuple[int, int, str, int]:
     )
 
 
+def neighbor_row_sort_key(row: tuple[Any, ...]) -> tuple[int, int, str, int]:
+    node_id = row[_NEIGHBOR_NODE_ID]
+    start_line = int(row[_NEIGHBOR_START_LINE] or 0)
+    if start_line < 1:
+        start_line = 1
+    return (
+        1 if row[_NEIGHBOR_KIND] in {"ExternalSymbol", "ExternalDependency"} else 0,
+        _NEIGHBOR_CONFIDENCE_ORDER.get(str(row[_NEIGHBOR_EDGE_CONFIDENCE] or ""), 2),
+        str(row[_NEIGHBOR_PATH] or ""),
+        0 if node_id is None else start_line,
+    )
+
+
 def sorted_neighbor_rows(rows: Any, limit: int) -> list[dict[str, Any]]:
-    neighbors = [neighbor_row_to_dict(row) for row in rows]
-    neighbors.sort(key=neighbor_sort_key)
-    return neighbors[:limit]
+    ordered_rows = list(rows)
+    ordered_rows.sort(key=neighbor_row_sort_key)
+    return [neighbor_row_to_dict(row) for row in ordered_rows[:limit]]
 
 
 def _bounded_sorted_neighbor_rows(
     conn: sqlite3.Connection,
     query: str,
-    count_query: str,
     repo_id: str,
     node_id: str,
     limit: int,
 ) -> list[dict[str, Any]]:
     if limit <= 0:
-        return sorted_neighbor_rows(conn.execute(query, (repo_id, node_id)), limit)
+        return sorted_neighbor_rows(conn.execute(query, (repo_id, node_id)).fetchall(), limit)
 
-    neighbor_count = conn.execute(count_query, (repo_id, node_id)).fetchone()[0]
-    if int(neighbor_count) <= limit:
-        return sorted_neighbor_rows(conn.execute(query, (repo_id, node_id)), limit)
+    probe_rows = conn.execute(f"{query} LIMIT ?", (repo_id, node_id, limit + 1)).fetchall()
+    if len(probe_rows) <= limit:
+        return sorted_neighbor_rows(probe_rows, limit)
 
     rows = conn.execute(
         f"{query}{_NEIGHBOR_ORDER_SQL} LIMIT ?",
         (repo_id, node_id, limit),
-    )
+    ).fetchall()
     return [neighbor_row_to_dict(row) for row in rows]
 
 
+def neighbor_node_row_to_dict(row: tuple[Any, ...] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    start_line = int(row[_NODE_ROW_START_LINE] or 0)
+    if start_line < 1:
+        start_line = 1
+    end_line = int(row[_NODE_ROW_END_LINE] or 0)
+    if end_line < start_line:
+        end_line = start_line
+    extra_json = row[_NODE_ROW_EXTRA_JSON] or "{}"
+    if extra_json == "{}":
+        extra = {}
+    else:
+        try:
+            extra = json.loads(extra_json)
+        except json.JSONDecodeError:
+            extra = {}
+    return {
+        "id": row[_NODE_ROW_ID],
+        "repo_id": row[_NODE_ROW_REPO_ID],
+        "owner_path": row[_NODE_ROW_OWNER_PATH],
+        "kind": row[_NODE_ROW_KIND],
+        "name": row[_NODE_ROW_NAME],
+        "qname": row[_NODE_ROW_QNAME],
+        "path": row[_NODE_ROW_PATH],
+        "start_line": start_line,
+        "end_line": end_line,
+        "signature": row[_NODE_ROW_SIGNATURE],
+        "doc": row[_NODE_ROW_DOC],
+        "confidence": row[_NODE_ROW_CONFIDENCE],
+        "content_hash": row[_NODE_ROW_CONTENT_HASH],
+        "rank": row[_NODE_ROW_RANK],
+        "extra": extra,
+    }
+
+
 def get_neighbors(conn: sqlite3.Connection, node_id: str, limit: int = 80) -> dict[str, Any]:
-    node = get_node(conn, node_id)
-    if not node:
-        return {"node": None, "outgoing": [], "incoming": []}
-    repo_id = str(node["repo_id"])
-    payload = {
-        "node": node,
-        "outgoing": _bounded_sorted_neighbor_rows(
+    row_factory = conn.row_factory
+    conn.row_factory = None
+    try:
+        node = neighbor_node_row_to_dict(
+            conn.execute(_NEIGHBOR_NODE_LOOKUP_SQL, (node_id,)).fetchone()
+        )
+        if not node:
+            return {"node": None, "outgoing": [], "incoming": []}
+        repo_id = str(node["repo_id"])
+        outgoing = _bounded_sorted_neighbor_rows(
             conn,
             _OUTGOING_NEIGHBORS_SQL,
-            _OUTGOING_NEIGHBOR_COUNT_SQL,
             repo_id,
             node_id,
             limit,
-        ),
-        "incoming": _bounded_sorted_neighbor_rows(
+        )
+        incoming = _bounded_sorted_neighbor_rows(
             conn,
             _INCOMING_NEIGHBORS_SQL,
-            _INCOMING_NEIGHBOR_COUNT_SQL,
             repo_id,
             node_id,
             limit,
-        ),
-    }
+        )
+    finally:
+        conn.row_factory = row_factory
+    payload = {"node": node, "outgoing": outgoing, "incoming": incoming}
     return payload
 
 
@@ -1127,13 +1231,45 @@ def embedding_counts(conn: sqlite3.Connection) -> dict[str, int]:
     return {"queued": int(queued), "embedded": int(embedded)}
 
 
-def neighbor_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    data = row_to_node_dict(row)
+def neighbor_row_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
+    node = None
+    if row[_NEIGHBOR_NODE_ID] is not None:
+        start_line = int(row[_NEIGHBOR_START_LINE] or 0)
+        if start_line < 1:
+            start_line = 1
+        end_line = int(row[_NEIGHBOR_END_LINE] or 0)
+        if end_line < start_line:
+            end_line = start_line
+        extra_json = row[_NEIGHBOR_EXTRA_JSON] or "{}"
+        if extra_json == "{}":
+            extra = {}
+        else:
+            try:
+                extra = json.loads(extra_json)
+            except json.JSONDecodeError:
+                extra = {}
+        node = {
+            "id": row[_NEIGHBOR_NODE_ID],
+            "repo_id": row[_NEIGHBOR_REPO_ID],
+            "owner_path": row[_NEIGHBOR_OWNER_PATH],
+            "kind": row[_NEIGHBOR_KIND],
+            "name": row[_NEIGHBOR_NAME],
+            "qname": row[_NEIGHBOR_QNAME],
+            "path": row[_NEIGHBOR_PATH],
+            "start_line": start_line,
+            "end_line": end_line,
+            "signature": row[_NEIGHBOR_SIGNATURE],
+            "doc": row[_NEIGHBOR_DOC],
+            "confidence": row[_NEIGHBOR_CONFIDENCE],
+            "content_hash": row[_NEIGHBOR_CONTENT_HASH],
+            "rank": row[_NEIGHBOR_RANK],
+            "extra": extra,
+        }
     return {
         "edge": {
-            "kind": data.pop("edge_kind"),
-            "confidence": data.pop("edge_confidence"),
-            "detail": data.pop("detail"),
+            "kind": row[_NEIGHBOR_EDGE_KIND],
+            "confidence": row[_NEIGHBOR_EDGE_CONFIDENCE],
+            "detail": row[_NEIGHBOR_EDGE_DETAIL],
         },
-        "node": data if data.get("id") else None,
+        "node": node,
     }

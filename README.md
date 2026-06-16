@@ -262,6 +262,14 @@ The adapter turns each sample into a tiny repository, then reports `hit_at_k` an
 MRR for the gold cross-file snippet path. It is a retrieval benchmark, not a
 code-generation benchmark.
 
+Run the full end-of-mission gate for quality checks, local-first assertions,
+benchmark comparison, Kuzu and embeddings validation, RepoBench adapter
+diagnostics, and CLI/API compatibility assertions:
+
+```bash
+uv run python scripts/final_quality_gate.py
+```
+
 ## License
 
 Apache-2.0.

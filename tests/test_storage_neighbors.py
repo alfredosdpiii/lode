@@ -18,9 +18,13 @@ def normalize_sql(statement: str) -> str:
     return " ".join(statement.split())
 
 
-def insert_high_degree_graph(conn: sqlite3.Connection, repo: Path) -> str:
+def insert_neighbor_graph(
+    conn: sqlite3.Connection,
+    repo: Path,
+    neighbor_count: int = HIGH_DEGREE_NEIGHBORS,
+) -> str:
     repo_id = upsert_repo(conn, repo)
-    center_id = f"{repo_id}:center"
+    center_id = f"{repo_id}:center:{neighbor_count}"
     node_rows: list[tuple[Any, ...]] = [
         (
             center_id,
@@ -41,9 +45,9 @@ def insert_high_degree_graph(conn: sqlite3.Connection, repo: Path) -> str:
     ]
     edge_rows: list[tuple[str, str, str, str, str, str, str]] = []
     confidences = ["heuristic", "strong", "resolved"]
-    for index in range(HIGH_DEGREE_NEIGHBORS):
+    for index in range(neighbor_count):
         target_id = f"{repo_id}:target:{index}"
-        path = f"pkg/{HIGH_DEGREE_NEIGHBORS - index:04d}_{index:04d}.py"
+        path = f"pkg/{neighbor_count - index:04d}_{index:04d}.py"
         kind = "ExternalSymbol" if index % 17 == 0 else "Function"
         confidence = confidences[index % len(confidences)]
         node_rows.append(
@@ -108,11 +112,35 @@ def insert_high_degree_graph(conn: sqlite3.Connection, repo: Path) -> str:
 
 
 class StorageNeighborTests(unittest.TestCase):
+    def test_low_degree_neighbors_skip_count_queries_when_limit_covers_rows(self) -> None:
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
+            repo = Path(repo_tmp)
+            with closing(connect(sqlite_path(Path(data_tmp)))) as conn:
+                node_id = insert_neighbor_graph(conn, repo, neighbor_count=3)
+                statements: list[str] = []
+                conn.set_trace_callback(statements.append)
+                try:
+                    neighbors = get_neighbors(conn, node_id, limit=80)
+                finally:
+                    conn.set_trace_callback(None)
+
+        self.assertEqual(len(neighbors["outgoing"]), 3)
+        self.assertEqual(len(neighbors["incoming"]), 3)
+        count_selects = [
+            normalize_sql(statement)
+            for statement in statements
+            if "COUNT(*) FROM edges" in normalize_sql(statement)
+        ]
+        self.assertEqual(count_selects, [])
+        for direction in ("outgoing", "incoming"):
+            keys = [neighbor_sort_key(item) for item in neighbors[direction]]
+            self.assertEqual(keys, sorted(keys))
+
     def test_high_degree_neighbors_preserve_public_ordering_when_limited(self) -> None:
         with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
             repo = Path(repo_tmp)
             with closing(connect(sqlite_path(Path(data_tmp)))) as conn:
-                node_id = insert_high_degree_graph(conn, repo)
+                node_id = insert_neighbor_graph(conn, repo)
 
                 full_neighbors = get_neighbors(conn, node_id, limit=HIGH_DEGREE_NEIGHBORS + 1)
                 limited_neighbors = get_neighbors(conn, node_id, limit=13)
@@ -140,7 +168,7 @@ class StorageNeighborTests(unittest.TestCase):
         with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as data_tmp:
             repo = Path(repo_tmp)
             with closing(connect(sqlite_path(Path(data_tmp)))) as conn:
-                node_id = insert_high_degree_graph(conn, repo)
+                node_id = insert_neighbor_graph(conn, repo)
                 statements: list[str] = []
                 conn.set_trace_callback(statements.append)
                 try:
