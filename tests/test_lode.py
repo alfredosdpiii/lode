@@ -21,6 +21,7 @@ from lode.indexer import index_repo, iter_source_files
 from lode.storage import (
     connect,
     embedding_counts,
+    external_like_terms_from_tokens,
     find_symbol,
     get_neighbors,
     search_nodes,
@@ -493,6 +494,33 @@ class LodeIndexTests(unittest.TestCase):
                 self.assertTrue(
                     any(hit["path"] == "src/lode/context.py" for hit in context["top_hits"])
                 )
+
+    def test_long_search_query_uses_single_broad_fts_lookup(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(repo_tmp)
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+            index_repo(repo, sqlite_path(data_dir))
+
+            long_query = (
+                "create user service save account profile controller repository "
+                "validate serialize response payload"
+            )
+            self.assertEqual(external_like_terms_from_tokens(long_query.split()), [])
+            self.assertEqual(external_like_terms_from_tokens(["print"]), ["print"])
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                results = search_nodes(conn, long_query, limit=5)
+                self.assertTrue(results)
+                self.assertTrue(any(row["path"] == "app.py" for row in results))
+
+                search_trace = trace_statements(
+                    conn, lambda: search_nodes(conn, long_query, limit=5)
+                )
+
+        self.assertEqual(count_selects(search_trace, "FROM node_fts"), 1)
 
     def test_neighbors_include_cross_file_callers_after_reindex(self) -> None:
         with (

@@ -149,10 +149,9 @@ def load_compact_neighbor_rows(
                e.confidence AS edge_confidence,
                n.kind AS node_kind,
                n.qname AS node_qname,
-               n.path AS node_path,
-               n.start_line AS node_start_line
+               n.path AS node_path
         FROM edges e
-        LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.dst
+        JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.dst
         WHERE e.repo_id = ? AND e.src IN ({placeholders})
         ORDER BY
           e.src,
@@ -168,10 +167,9 @@ def load_compact_neighbor_rows(
                e.confidence AS edge_confidence,
                n.kind AS node_kind,
                n.qname AS node_qname,
-               n.path AS node_path,
-               n.start_line AS node_start_line
+               n.path AS node_path
         FROM edges e
-        LEFT JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.src
+        JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.src
         WHERE e.repo_id = ? AND e.dst IN ({placeholders})
         ORDER BY
           e.dst,
@@ -180,25 +178,30 @@ def load_compact_neighbor_rows(
           n.path,
           n.start_line
         """
-    rows = conn.execute(
-        sql,
-        [repo_id, *node_ids],
-    )
-    counts = {node_id: 0 for node_id in node_ids}
-    for row in rows:
-        center_id = str(row["center_id"])
-        if counts.get(center_id, 0) >= limit or row["node_qname"] is None:
-            continue
-        related[center_id][direction].append(
-            {
-                "edge": row["edge_kind"],
-                "qname": row["node_qname"],
-                "kind": row["node_kind"],
-                "path": row["node_path"],
-                "confidence": row["edge_confidence"],
-            }
+    row_factory = conn.row_factory
+    conn.row_factory = None
+    try:
+        rows = conn.execute(
+            sql,
+            [repo_id, *node_ids],
         )
-        counts[center_id] = counts.get(center_id, 0) + 1
+        counts = {node_id: 0 for node_id in node_ids}
+        for row in rows:
+            center_id = str(row[0])
+            if counts.get(center_id, 0) >= limit or row[4] is None:
+                continue
+            related[center_id][direction].append(
+                {
+                    "edge": row[1],
+                    "qname": row[4],
+                    "kind": row[3],
+                    "path": row[5],
+                    "confidence": row[2],
+                }
+            )
+            counts[center_id] = counts.get(center_id, 0) + 1
+    finally:
+        conn.row_factory = row_factory
 
 
 def reason_for_hit(node: dict[str, Any], query: str) -> str:

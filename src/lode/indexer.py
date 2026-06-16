@@ -73,7 +73,7 @@ EXCLUDED_DIRS = {
 }
 
 PARALLEL_PARSE_THRESHOLD = 8
-MAX_PARSE_WORKERS = 8
+MAX_PARSE_WORKERS = 6
 ParseJob = tuple[str, str, str, float, int, str]
 
 
@@ -243,6 +243,8 @@ def parse_file(
         import_bindings = []
     nodes.extend(extra_nodes)
     edges.extend(extra_edges)
+    nodes = dedupe_parsed_nodes(nodes)
+    edges = dedupe_parsed_edges(edges)
     if import_bindings:
         file_node.extra["imports"] = import_bindings
     file_size = size if size is not None else path.stat().st_size
@@ -257,6 +259,29 @@ def parse_file(
         nodes=nodes,
         edges=edges,
     )
+
+
+def dedupe_parsed_nodes(nodes: list[Node]) -> list[Node]:
+    seen: set[str] = set()
+    out: list[Node] = []
+    for node in nodes:
+        if node.id in seen:
+            continue
+        seen.add(node.id)
+        out.append(node)
+    return out
+
+
+def dedupe_parsed_edges(edges: list[Edge]) -> list[Edge]:
+    seen: set[tuple[str, str, str, str]] = set()
+    out: list[Edge] = []
+    for edge in edges:
+        key = (edge.src, edge.dst, edge.kind, edge.detail)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(edge)
+    return out
 
 
 def make_node(
@@ -337,6 +362,7 @@ def parse_python(
         if node is None:
             node = external_node(kind, name, rel)
             external_cache[key] = node
+            nodes.append(node)
         return node
 
     module = module_qname(rel)
@@ -376,7 +402,6 @@ def parse_python(
                 base_name = dotted_name(base)
                 if base_name:
                     base_node = cached_external_node("ExternalSymbol", base_name)
-                    nodes.append(base_node)
                     edges.append(
                         Edge(
                             class_node.id,
@@ -409,7 +434,6 @@ def parse_python(
                     {"module": import_module, "name": None, "alias": alias.asname}
                 )
                 dep = cached_external_node("ExternalDependency", import_module)
-                nodes.append(dep)
                 edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", import_module))
         elif isinstance(import_node, ast.ImportFrom):
             module = import_node.module or ""
@@ -426,7 +450,6 @@ def parse_python(
                     import_bindings.append({"module": module, "name": alias.name, "alias": None})
             if module:
                 dep = cached_external_node("ExternalDependency", module)
-                nodes.append(dep)
                 edges.append(Edge(file_node_id, dep.id, "IMPORTS", "strong", module))
         elif isinstance(import_node, ast.Call):
             call_nodes.append(import_node)
@@ -444,7 +467,6 @@ def parse_python(
             edges.append(Edge(caller_id, target_id, "CALLS", "strong", call_name))
         else:
             target = cached_external_node("ExternalSymbol", call_name)
-            nodes.append(target)
             edges.append(Edge(caller_id, target.id, "CALLS", "heuristic", call_name))
     return nodes, edges, import_bindings
 

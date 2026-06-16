@@ -11,6 +11,7 @@ from .config import repo_id_for_root, sqlite_path
 from .model import Edge, FileIndex, Node
 
 _QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
+STRUCTURED_FTS_TOKEN_LIMIT = 8
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
@@ -487,6 +488,8 @@ def external_like_terms(query: str) -> list[str]:
 
 
 def external_like_terms_from_tokens(tokens: list[str]) -> list[str]:
+    if len(tokens) > STRUCTURED_FTS_TOKEN_LIMIT:
+        return []
     return [token.lower() for token in tokens[:12]]
 
 
@@ -651,10 +654,11 @@ def search_nodes(
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     tokens = query_tokens(query)
-    strict_fts = fts_query_from_tokens(tokens, operator="")
+    use_structured_fts_probes = len(tokens) <= STRUCTURED_FTS_TOKEN_LIMIT
+    strict_fts = fts_query_from_tokens(tokens, operator="") if use_structured_fts_probes else ""
     broad_fts = fts_query_from_tokens(tokens)
-    path_fts = path_fts_query_from_tokens(tokens)
-    column_fts = column_fts_query_from_tokens(tokens)
+    path_fts = path_fts_query_from_tokens(tokens) if use_structured_fts_probes else ""
+    column_fts = column_fts_query_from_tokens(tokens) if use_structured_fts_probes else ""
     if strict_fts or broad_fts:
         candidates: list[dict[str, Any]] = []
         if path_fts:
@@ -725,7 +729,7 @@ def search_nodes(
             except sqlite3.OperationalError:
                 pass
 
-        if strict_fts and not candidates and len(tokens) <= 8:
+        if strict_fts and not candidates:
             try:
                 if repo_id:
                     strict_rows = conn.execute(
@@ -761,7 +765,7 @@ def search_nodes(
         if broad_fts and broad_fts != strict_fts and unique_node_count(candidates, limit) < limit:
             try:
                 current_count = unique_node_count(candidates, limit)
-                if current_count < max(1, limit // 2):
+                if current_count < max(1, limit // 2) and column_fts:
                     if column_candidates:
                         candidates.extend(column_candidates)
                     else:
