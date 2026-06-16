@@ -24,6 +24,7 @@ from lode.storage import (
     external_like_terms_from_tokens,
     find_symbol,
     get_neighbors,
+    repo_filter,
     search_nodes,
 )
 
@@ -119,6 +120,24 @@ class LodeIndexTests(unittest.TestCase):
 
             indexed = {path.relative_to(repo).as_posix() for path in iter_source_files(repo)}
             self.assertEqual(indexed, {"src/app.py"})
+
+    def test_repo_filter_rejects_unsafe_path_inputs(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as parent_tmp,
+            tempfile.TemporaryDirectory() as data_tmp,
+        ):
+            repo = Path(parent_tmp) / "repo with spaces"
+            repo.mkdir()
+            data_dir = Path(data_tmp)
+            write_sample_repo(repo)
+
+            stats = index_repo(repo, sqlite_path(data_dir))
+
+            with closing(connect(sqlite_path(data_dir))) as conn:
+                self.assertEqual(repo_filter(conn, str(repo)), stats.repo_id)
+                self.assertIsNone(repo_filter(conn, str(repo / ".." / "other")))
+                self.assertIsNone(repo_filter(conn, "bad\npath"))
+                self.assertIsNone(repo_filter(conn, "\x00"))
 
     def test_batch_replace_preserves_nodes_edges_and_queue(self) -> None:
         with (

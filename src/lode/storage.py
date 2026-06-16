@@ -11,6 +11,7 @@ from .config import repo_id_for_root, sqlite_path
 from .model import Edge, FileIndex, Node
 
 _QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
+_REPO_PATH_RE = re.compile(r"^[A-Za-z0-9_./:\-~ ]+$")
 STRUCTURED_FTS_TOKEN_LIMIT = 8
 
 
@@ -440,10 +441,21 @@ def list_repos(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 def repo_filter(conn: sqlite3.Connection, repo_path: str | None) -> str | None:
     if not repo_path:
         return None
+    if not _is_safe_repo_path_input(repo_path):
+        return None
     root = Path(repo_path).expanduser().resolve()
     repo_id = repo_id_for_root(root)
     exists = conn.execute("SELECT 1 FROM repos WHERE id = ?", (repo_id,)).fetchone()
     return repo_id if exists else None
+
+
+def _is_safe_repo_path_input(repo_path: str) -> bool:
+    if not repo_path or len(repo_path) > 4096:
+        return False
+    if "\x00" in repo_path or not _REPO_PATH_RE.fullmatch(repo_path):
+        return False
+    path = Path(repo_path)
+    return not any(part == ".." for part in path.parts)
 
 
 def fts_query(query: str, operator: str = "OR") -> str:

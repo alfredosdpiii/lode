@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -286,7 +287,9 @@ class BenchCompareOperationalTests(unittest.TestCase):
             json.dump(current, fh)
             current_path = Path(fh.name)
 
-        output_path = Path(tempfile.mktemp(suffix=".json"))
+        output_fd, output_name = tempfile.mkstemp(suffix=".json")
+        os.close(output_fd)
+        output_path = Path(output_name)
         try:
             result = subprocess.run(
                 [
