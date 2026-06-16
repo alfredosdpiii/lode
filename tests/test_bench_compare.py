@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BASELINE_DIR = PROJECT_ROOT / "benchmarks" / "baselines"
 
 BENCH_COMPARE = [sys.executable, "scripts/bench_compare.py"]
 
@@ -979,7 +980,7 @@ class BenchCompareSmokeTests(unittest.TestCase):
 
 
 def load_baseline() -> dict:
-    path = PROJECT_ROOT / "bench-results" / "20260531T184011Z" / "lode.json"
+    path = BASELINE_DIR / "lode-operational-20260531.json"
     data = json.loads(path.read_text())
     assert isinstance(data, dict)
     return data
@@ -1009,12 +1010,7 @@ def make_passing_operational_current() -> dict:
 
 
 def load_repobench_baseline() -> dict:
-    path = (
-        PROJECT_ROOT
-        / "bench-results"
-        / "20260531T203339Z-full-repobench-r"
-        / "lode-context-ql5-combined.json"
-    )
+    path = BASELINE_DIR / "repobench-python-v1.1-context-20260531.json"
     data = json.loads(path.read_text())
     assert isinstance(data, dict)
     return data

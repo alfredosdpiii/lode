@@ -11,13 +11,9 @@ from typing import Any, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-OPERATIONAL_BASELINE = PROJECT_ROOT / "bench-results" / "20260531T184011Z" / "lode.json"
-REPOBENCH_BASELINE = (
-    PROJECT_ROOT
-    / "bench-results"
-    / "20260531T203339Z-full-repobench-r"
-    / "lode-context-ql5-combined.json"
-)
+BASELINE_DIR = PROJECT_ROOT / "benchmarks" / "baselines"
+OPERATIONAL_BASELINE = BASELINE_DIR / "lode-operational-20260531.json"
+REPOBENCH_BASELINE = BASELINE_DIR / "repobench-python-v1.1-context-20260531.json"
 
 APPROVED_PARAMETERS: dict[str, dict[str, Any]] = {
     "operational": {
