@@ -26,6 +26,8 @@ from .storage import (
     upsert_embeddings,
 )
 
+EMBEDDING_TEXT_MAX_INPUT_CHARS = 384
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -286,7 +288,23 @@ def embedding_text(node: dict[str, Any]) -> str:
         str(node.get("signature") or ""),
         str(node.get("doc") or ""),
     ]
-    return "\n".join(part for part in parts if part)
+    return join_bounded_embedding_parts(parts)
+
+
+def join_bounded_embedding_parts(parts: list[str]) -> str:
+    out: list[str] = []
+    used = 0
+    for part in parts:
+        if not part:
+            continue
+        separator_chars = 1 if out else 0
+        available = EMBEDDING_TEXT_MAX_INPUT_CHARS - used - separator_chars
+        if available <= 0:
+            break
+        segment = part[:available]
+        out.append(segment)
+        used += separator_chars + len(segment)
+    return "\n".join(out)
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

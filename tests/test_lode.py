@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from lode.cli import EMBEDDING_TEXT_MAX_INPUT_CHARS, embedding_text
 from lode.config import sqlite_path
 from lode.context import build_context_pack, compact_neighbors
 from lode.indexer import index_repo, iter_source_files
@@ -77,6 +78,18 @@ def stop_fake_embedding_server(server: ThreadingHTTPServer, thread: threading.Th
 
 
 class LodeIndexTests(unittest.TestCase):
+    def test_embedding_text_caps_large_payloads_while_preserving_identity(self) -> None:
+        text = embedding_text(
+            {
+                "qname": "docs.long_section",
+                "signature": "### Long Section",
+                "doc": "x" * (EMBEDDING_TEXT_MAX_INPUT_CHARS * 4),
+            }
+        )
+
+        self.assertLessEqual(len(text), EMBEDDING_TEXT_MAX_INPUT_CHARS)
+        self.assertTrue(text.startswith("docs.long_section\n### Long Section\n"))
+
     def test_parse_file_with_explicit_text_matches_disk(self) -> None:
         with tempfile.TemporaryDirectory() as repo_tmp:
             repo = Path(repo_tmp)
