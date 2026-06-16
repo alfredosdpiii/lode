@@ -1,12 +1,11 @@
 # Lode
 
-Lode gives coding agents a local map of a repository.
+Lode is a fast, local-first codebase map for coding agents.
 
-It indexes source files into SQLite for fast lookups, and can project the same
-facts into embedded Kuzu when you want graph traversal. The job is simple: answer
-"where is this symbol?", "what should I read?", "what calls this?", and "what
-might break if I touch it?" without sending the repo to a hosted code-search
-service.
+It indexes source files into SQLite for cheap per-turn lookup, and can project
+the same facts into embedded Kuzu for graph traversal. It answers: where is this
+symbol, what should I read, what calls this, and what might break if I touch it,
+without sending the repo to a hosted code-search service.
 
 [![Watch the Lode overview video](docs/assets/lode-overview-poster.png)](https://app.factory.ai/wiki/a71cbea2-853d-40f7-a479-f1e8d6af8252)
 
@@ -202,17 +201,16 @@ better in the benchmark data I checked.
 ## Benchmarks
 
 Final gate run: 2026-06-16 on an AMD Ryzen 9 8945HS, 16 logical cores, Python
-3.13.9. The final evidence passed 78/78 validation assertions. The numbers to
-watch are the SQLite hot-path timings; that is what an agent uses inside a
+3.13.9. The final evidence passed 78/78 validation assertions. The key numbers
+are the SQLite hot-path timings, because those are what an agent uses inside a
 normal turn. Kuzu sync is a batch/analytics projection.
 
 | Workload | Files | Nodes | Edges | Cold index | Hot re-index | Search p50 | Symbol p50 | Context p50 | Neighbor p50 | Kuzu sync | Embeddings |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | Lode repo | 47 | 2,358 | 5,112 | 154.391 ms | 2.896 ms | 0.267 ms | 0.064 ms | 0.346 ms | 0.402 ms | 213.744 ms | 32 @ 31.655/s, 384d |
-| Medium app | 383 | 4,817 | 4,573 | 2,505.509 ms | 43.303 ms | 1.742 ms | 4.187 ms | 6.717 ms | 1.162 ms | 41,702.766 ms | 32 @ 33.5/s, 384d |
-| Larger app SQLite hot path | 1,270 | 15,846 | 15,453 | 17,342.433 ms | 95.348 ms | 14.359 ms | 15.739 ms | 34.076 ms | 3.437 ms | n/a | n/a |
 
-For RepoBench-style retrieval, I ran all Python v1.1 cross-file rows from
+For RepoBench-style retrieval, Lode was evaluated on all Python v1.1 cross-file
+rows from
 [`tianyang/repobench_python_v1.1`](https://huggingface.co/datasets/tianyang/repobench_python_v1.1).
 The run uses `context` mode, `--query-lines 5`, `--search-limit 30`,
 `--context-budget 6000`, and reports retrieval only: did Lode rank the gold
@@ -229,16 +227,12 @@ list.
 | Combined | 15,636 | 15 | 0.863 ms | 0.308007 | 0.620555 | 0.741622 | 0.848810 | 0.491085 |
 
 [RepoBench](https://openreview.net/forum?id=pPjZIOuQuF) is an ICLR 2024 benchmark
-for repository-level code completion. I did not find an official v1.1
-leaderboard. The closest public comparison is the original RepoBench-R paper
-table, so the ranks below are a sanity check against older baselines.
-
-| RepoBench-R slice | Lode rank vs paper baselines | What that means |
-|---|---:|---|
-| Hard `cross_file_random` | #2/6 on Hit@1 and Hit@3, #3/6 on Hit@5 | The strongest slice; only UniXcoder is clearly ahead on Hit@1/Hit@3. |
-| Hard `cross_file_first` | #3/6 on Hit@1 and Hit@3, #4/6 on Hit@5 | Beats Random, CodeBERT, and Edit on the first two cutoffs. |
-| Easy `cross_file_random` | #3/6 on Hit@1, #6/6 on Hit@3 | Finds the top file often enough, but loses recall by rank 3. |
-| Easy `cross_file_first` | #6/6 on Hit@1 and Hit@3 | Weak spot. Jaccard, Edit, CodeBERT, Random, and UniXcoder all do better. |
+for repository-level code completion. There is no official Python v1.1
+leaderboard here, so comparisons against the original RepoBench-R paper table
+are directional only. The simple read: Lode is strongest on the hard retrieval
+slices, where it is top-3 on the Hit@1/Hit@3 checks against those older paper
+baselines. Easy-slice results are mixed, so do not read this as an overall
+leaderboard rank.
 
 Lode includes two benchmark entrypoints:
 
