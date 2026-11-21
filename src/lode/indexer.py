@@ -14,6 +14,7 @@ from typing import Any
 from .graph import resolve_graph
 from .model import Edge, FileIndex, Node
 from .storage import (
+    PYTHON_KEYWORD_STOPWORDS,
     connect,
     remove_missing_file_rows,
     replace_file_indexes_rows,
@@ -75,6 +76,65 @@ EXCLUDED_DIRS = {
 PARALLEL_PARSE_THRESHOLD = 8
 MAX_PARSE_WORKERS = 6
 ParseJob = tuple[str, str, str, float, int, str]
+
+_BODY_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,}")
+_CAMEL_PART_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
+_PY_FALLBACK_DEF_RE = re.compile(
+    r"^([ 	]*)(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)"
+)
+_PY_FALLBACK_CLASS_RE = re.compile(
+    r"^([ 	]*)class\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(([^)]*)\))?\s*:"
+)
+_PY_FALLBACK_FROM_RE = re.compile(r"^\s*from\s+(\.*[A-Za-z0-9_.]*)\s+import\s+(.+)$")
+_PY_FALLBACK_IMPORT_RE = re.compile(r"^\s*import\s+(.+)$")
+_PY_FALLBACK_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(.+)$")
+_BODY_STOPWORDS = PYTHON_KEYWORD_STOPWORDS | frozenset(
+    {
+        "lambda",
+        "yield",
+        "raise",
+        "assert",
+        "async",
+        "await",
+        "const",
+        "let",
+        "var",
+        "function",
+        "export",
+        "default",
+        "this",
+        "new",
+        "null",
+        "undefined",
+    }
+)
+
+
+def extract_fts_body(text: str, max_chars: int = 1600) -> str:
+    if not text or max_chars <= 0:
+        return ""
+    tokens: list[str] = []
+    seen: set[str] = set()
+    used = 0
+    for raw in _BODY_TOKEN_RE.findall(text[: max_chars * 8]):
+        for candidate in _token_and_parts(raw):
+            low = candidate.lower()
+            if len(low) <= 1 or low in _BODY_STOPWORDS or low in seen:
+                continue
+            seen.add(low)
+            used += len(candidate) + 1
+            if used > max_chars:
+                return " ".join(tokens)
+            tokens.append(candidate)
+    return " ".join(tokens)
+
+
+def _token_and_parts(raw: str) -> list[str]:
+    out = [raw]
+    for chunk in raw.split("_"):
+        if chunk:
+            out.extend(_CAMEL_PART_RE.findall(chunk))
+    return out
 
 
 @dataclass(slots=True)
@@ -229,6 +289,9 @@ def parse_file(
         content_hash,
         doc="",
     )
+    fts_body = extract_fts_body(text, max_chars=1600)
+    if fts_body:
+        file_node.extra["fts_body"] = fts_body
     nodes = [file_node]
     edges: list[Edge] = []
     if language == "python":
@@ -369,7 +432,7 @@ def parse_python(
     try:
         tree = ast.parse(text)
     except SyntaxError as exc:
-        node = make_node(
+        err_node = make_node(
             "ParseError",
             "SyntaxError",
             f"{module}.SyntaxError",
@@ -380,7 +443,14 @@ def parse_python(
             doc=str(exc),
             confidence="exact",
         )
-        return [node], [Edge(file_node_id, node.id, "HAS_PARSE_ERROR", "exact")], []
+        fb_nodes, fb_edges, fb_imports = _parse_python_fallback(
+            rel, module, text, file_node_id, cached_external_node
+        )
+        return (
+            [err_node, *fb_nodes],
+            [Edge(file_node_id, err_node.id, "HAS_PARSE_ERROR", "exact"), *fb_edges],
+            fb_imports,
+        )
 
     lines = text.splitlines()
     symbol_by_name: dict[str, str] = {}
@@ -424,6 +494,11 @@ def parse_python(
                     )
                     nodes.extend(route_nodes)
                     edges.extend(route_edges)
+        elif isinstance(item, (ast.Assign, ast.AnnAssign)):
+            for var_node in python_assign_nodes(module, rel, item, lines):
+                nodes.append(var_node)
+                symbol_by_name[var_node.name] = var_node.id
+                edges.append(Edge(file_node_id, var_node.id, "DEFINES", "exact"))
 
     call_nodes: list[ast.Call] = []
     for import_node in iter_imports_and_calls(tree):
@@ -502,7 +577,7 @@ def python_function_node(
     end = getattr(node, "end_lineno", start)
     doc = ast.get_docstring(node) or ""
     body = slice_lines(lines, start, end)
-    return make_node(
+    fn_node = make_node(
         kind,
         node.name,
         f"{prefix}.{node.name}",
@@ -514,6 +589,10 @@ def python_function_node(
         doc,
         "exact",
     )
+    fts_body = extract_fts_body(body, max_chars=600)
+    if fts_body:
+        fn_node.extra["fts_body"] = fts_body
+    return fn_node
 
 
 def python_class_node(module: str, rel: str, node: ast.ClassDef, lines: list[str]) -> Node:
@@ -524,7 +603,7 @@ def python_class_node(module: str, rel: str, node: ast.ClassDef, lines: list[str
     signature = f"class {node.name}" + (f"({', '.join(bases)})" if bases else "")
     doc = ast.get_docstring(node) or ""
     body = slice_lines(lines, start, end)
-    return make_node(
+    cls_node = make_node(
         "Class",
         node.name,
         f"{module}.{node.name}",
@@ -536,6 +615,135 @@ def python_class_node(module: str, rel: str, node: ast.ClassDef, lines: list[str
         doc,
         "exact",
     )
+    fts_body = extract_fts_body(body, max_chars=600)
+    if fts_body:
+        cls_node.extra["fts_body"] = fts_body
+    return cls_node
+
+
+def python_assign_nodes(
+    module: str, rel: str, item: ast.Assign | ast.AnnAssign, lines: list[str]
+) -> list[Node]:
+    targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+    start = getattr(item, "lineno", 1)
+    end = getattr(item, "end_lineno", start)
+    body = slice_lines(lines, start, end)
+    sig = body.splitlines()[0].strip()[:160] if body else ""
+    out: list[Node] = []
+    for target in targets:
+        if not isinstance(target, ast.Name) or target.id.startswith("__"):
+            continue
+        out.append(
+            make_node(
+                "Variable",
+                target.id,
+                f"{module}.{target.id}",
+                rel,
+                start,
+                end,
+                body,
+                sig,
+                "",
+                "exact",
+            )
+        )
+    return out
+
+
+def _parse_python_fallback(
+    rel: str,
+    module: str,
+    text: str,
+    file_node_id: str,
+    cached_external_node: Any,
+) -> tuple[list[Node], list[Edge], list[dict[str, Any]]]:
+    nodes: list[Node] = []
+    edges: list[Edge] = []
+    import_bindings: list[dict[str, Any]] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        _collect_fallback_line(
+            rel,
+            module,
+            lineno,
+            line,
+            file_node_id,
+            cached_external_node,
+            nodes,
+            edges,
+            import_bindings,
+        )
+    return nodes, edges, import_bindings
+
+
+def _collect_fallback_line(
+    rel: str,
+    module: str,
+    lineno: int,
+    line: str,
+    file_node_id: str,
+    cached_external_node: Any,
+    nodes: list[Node],
+    edges: list[Edge],
+    import_bindings: list[dict[str, Any]],
+) -> None:
+    if m := _PY_FALLBACK_DEF_RE.match(line):
+        name, args = m.group(2), m.group(3).strip()
+        node = make_node(
+            "Function",
+            name,
+            f"{module}.{name}",
+            rel,
+            lineno,
+            lineno,
+            line,
+            f"{name}({args})",
+            "",
+            "heuristic",
+        )
+        nodes.append(node)
+        edges.append(Edge(file_node_id, node.id, "DEFINES", "heuristic"))
+        return
+    if m := _PY_FALLBACK_CLASS_RE.match(line):
+        name, bases = m.group(2), (m.group(3) or "").strip()
+        sig = f"class {name}({bases})" if bases else f"class {name}"
+        node = make_node(
+            "Class", name, f"{module}.{name}", rel, lineno, lineno, line, sig, "", "heuristic"
+        )
+        nodes.append(node)
+        edges.append(Edge(file_node_id, node.id, "DEFINES", "heuristic"))
+        return
+    if m := _PY_FALLBACK_FROM_RE.match(line):
+        mod, names = m.group(1), m.group(2).split("#", 1)[0]
+        for entry in _split_import_clause(names):
+            import_bindings.append({"module": mod, "name": entry["name"], "alias": entry["alias"]})
+        if mod:
+            dep = cached_external_node("ExternalDependency", mod)
+            edges.append(Edge(file_node_id, dep.id, "IMPORTS", "heuristic", mod))
+        return
+    if m := _PY_FALLBACK_IMPORT_RE.match(line):
+        for entry in _split_import_clause(m.group(1).split("#", 1)[0]):
+            mod = entry["name"]
+            import_bindings.append({"module": mod, "name": None, "alias": entry["alias"]})
+            dep = cached_external_node("ExternalDependency", mod)
+            edges.append(Edge(file_node_id, dep.id, "IMPORTS", "heuristic", mod))
+        return
+    if m := _PY_FALLBACK_ASSIGN_RE.match(line):
+        name = m.group(1)
+        if not name.startswith("__"):
+            node = make_node(
+                "Variable",
+                name,
+                f"{module}.{name}",
+                rel,
+                lineno,
+                lineno,
+                line,
+                line.strip()[:160],
+                "",
+                "heuristic",
+            )
+            nodes.append(node)
+            edges.append(Edge(file_node_id, node.id, "DEFINES", "heuristic"))
 
 
 def route_facts_for_python(

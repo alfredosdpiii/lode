@@ -11,8 +11,45 @@ from .config import repo_id_for_root, sqlite_path
 from .model import Edge, FileIndex, Node
 
 _QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
+_IDENT_PART_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
+_WORD_SPLIT_RE = re.compile(r"[A-Za-z0-9_]+")
 _REPO_PATH_RE = re.compile(r"^[A-Za-z0-9_./:\-~ ]+$")
+_FTS_RESERVED = frozenset({"and", "or", "not", "near"})
+PYTHON_KEYWORD_STOPWORDS = frozenset(
+    {
+        "self",
+        "cls",
+        "none",
+        "true",
+        "false",
+        "return",
+        "def",
+        "class",
+        "import",
+        "from",
+        "as",
+        "with",
+        "for",
+        "while",
+        "try",
+        "except",
+        "finally",
+        "pass",
+        "if",
+        "else",
+        "elif",
+        "in",
+        "is",
+        "and",
+        "or",
+        "not",
+    }
+)
+ENGLISH_STOPWORDS = frozenset({"the", "to", "of", "a", "an"})
+_BROAD_STOPWORDS = PYTHON_KEYWORD_STOPWORDS | ENGLISH_STOPWORDS
 STRUCTURED_FTS_TOKEN_LIMIT = 8
+BROAD_FTS_TOKEN_LIMIT = 48
+_BM25_EXPR = "bm25(node_fts, 0.0, 8.0, 12.0, 4.0, 1.5, 6.0)"
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
@@ -231,28 +268,10 @@ def replace_file_indexes_rows(
     for file_index in file_indexes:
         deduped_nodes = deduped_nodes_by_path[file_index.path]
         for node in deduped_nodes:
-            node_values.append(
-                (
-                    node.id,
-                    repo_id,
-                    file_index.path,
-                    node.kind,
-                    node.name,
-                    node.qname,
-                    node.path,
-                    node.start_line,
-                    node.end_line,
-                    node.signature,
-                    node.doc,
-                    node.confidence,
-                    node.content_hash,
-                    json.dumps(node.extra, sort_keys=True),
-                )
-            )
-            if node.kind not in {"ExternalSymbol", "ExternalDependency"}:
-                fts_values.append(
-                    (node.id, node.qname, node.name, node.signature, node.doc, node.path)
-                )
+            node_row, fts_row = _build_node_storage_rows(repo_id, file_index.path, node)
+            node_values.append(node_row)
+            if fts_row is not None:
+                fts_values.append(fts_row)
             if (
                 node.kind in {"Function", "Method", "Class", "Route", "DocSection"}
                 and node.content_hash
@@ -473,6 +492,93 @@ def _is_safe_repo_path_input(stripped_repo_path: str) -> bool:
     return not any(part == ".." for part in stripped_repo_path.split("/"))
 
 
+def _build_node_storage_rows(
+    repo_id: str, owner_path: str, node: Node
+) -> tuple[tuple[Any, ...], tuple[Any, ...] | None]:
+    fts_body = str(node.extra.get("fts_body") or "") if "fts_body" in node.extra else ""
+    extra_payload = (
+        {k: v for k, v in node.extra.items() if k != "fts_body"}
+        if "fts_body" in node.extra
+        else node.extra
+    )
+    node_row = (
+        node.id,
+        repo_id,
+        owner_path,
+        node.kind,
+        node.name,
+        node.qname,
+        node.path,
+        node.start_line,
+        node.end_line,
+        node.signature,
+        node.doc,
+        node.confidence,
+        node.content_hash,
+        json.dumps(extra_payload, sort_keys=True),
+    )
+    if node.kind in {"ExternalSymbol", "ExternalDependency"}:
+        return node_row, None
+    fts_doc = f"{node.doc} {fts_body}".strip() if fts_body else node.doc
+    fts_row = (
+        node.id,
+        expand_fts_field(node.qname),
+        expand_fts_field(node.name),
+        expand_fts_field(node.signature),
+        fts_doc,
+        expand_fts_field(node.path),
+    )
+    return node_row, fts_row
+
+
+def _split_word_parts(word: str) -> list[str]:
+    parts: list[str] = []
+    for chunk in word.split("_"):
+        if chunk:
+            parts.extend(_IDENT_PART_RE.findall(chunk))
+    return parts
+
+
+def expand_fts_field(value: str) -> str:
+    if not value:
+        return ""
+    extras: list[str] = []
+    seen: set[str] = set()
+    for raw in _WORD_SPLIT_RE.findall(value):
+        seen.add(raw.lower())
+        for part in _split_word_parts(raw):
+            low = part.lower()
+            if len(low) > 1 and low not in seen:
+                seen.add(low)
+                extras.append(low)
+    return f"{value} {' '.join(extras)}" if extras else value
+
+
+def _expand_query_tokens(tokens: list[str], limit: int) -> list[str]:
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for raw in tokens:
+        for word in _WORD_SPLIT_RE.findall(raw):
+            for candidate in (word, *_split_word_parts(word)):
+                low = candidate.lower()
+                if len(low) <= 1 or low in _FTS_RESERVED or low in seen:
+                    continue
+                seen.add(low)
+                expanded.append(candidate)
+                if len(expanded) >= limit:
+                    return expanded
+    return expanded
+
+
+def _quote_fts_token(token: str) -> str:
+    cleaned = token.replace('"', "")
+    if not cleaned:
+        return ""
+    if cleaned.lower() in _FTS_RESERVED or any(ch in cleaned for ch in "./:-"):
+        return f'"{cleaned}"'
+    return cleaned
+
+
 def fts_query(query: str, operator: str = "OR") -> str:
     tokens = query_tokens(query)
     return fts_query_from_tokens(tokens, operator=operator)
@@ -485,8 +591,16 @@ def query_tokens(query: str) -> list[str]:
 def fts_query_from_tokens(tokens: list[str], operator: str = "OR") -> str:
     if not tokens:
         return ""
+    if operator == "OR":
+        expanded = _expand_query_tokens(tokens, BROAD_FTS_TOKEN_LIMIT)
+        chosen = [t for t in expanded if t.lower() not in _BROAD_STOPWORDS] or expanded
+    else:
+        chosen = [t for t in tokens[:12] if t.lower() not in _FTS_RESERVED]
+    quoted = [q for q in (_quote_fts_token(t) for t in chosen) if q]
+    if not quoted:
+        return ""
     separator = f" {operator} " if operator else " "
-    return separator.join(tokens[:12])
+    return separator.join(quoted)
 
 
 def path_fts_query(query: str) -> str:
@@ -674,6 +788,59 @@ def stable_search_results(candidates: list[dict[str, Any]], limit: int) -> list[
     return results
 
 
+def _run_fts_bm25(
+    conn: sqlite3.Connection,
+    fts_expr: str,
+    repo_id: str | None,
+    limit: int,
+    rank_bias: float = 0.0,
+) -> list[dict[str, Any]]:
+    if not fts_expr:
+        return []
+    repo_clause = "AND n.repo_id = ?" if repo_id else ""
+    params: tuple[Any, ...] = (fts_expr, repo_id, limit) if repo_id else (fts_expr, limit)
+    sql = f"""
+        SELECT n.*, ({_BM25_EXPR} + ?) AS rank
+        FROM node_fts
+        JOIN nodes n ON n.id = node_fts.node_id
+        WHERE node_fts MATCH ?
+          {repo_clause}
+          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
+        ORDER BY rank
+        LIMIT ?
+    """  # nosec B608
+    try:
+        rows = conn.execute(sql, (rank_bias, *params))
+        return [row_to_node_dict(row) for row in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
+def _like_search_nodes(
+    conn: sqlite3.Connection,
+    query: str,
+    repo_id: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    like = f"%{query}%"
+    repo_clause = "repo_id = ? AND" if repo_id else ""
+    sql = f"""
+        SELECT *, 0.0 AS rank FROM nodes
+        WHERE {repo_clause} (qname LIKE ? OR name LIKE ? OR path LIKE ? OR doc LIKE ?)
+        ORDER BY
+          CASE WHEN kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
+          CASE WHEN name = ? THEN 0 ELSE 1 END,
+          length(qname)
+        LIMIT ?
+    """  # nosec B608
+    params: tuple[Any, ...] = (
+        (repo_id, like, like, like, like, query, limit)
+        if repo_id
+        else (like, like, like, like, query, limit)
+    )
+    return [row_to_node_dict(row) for row in conn.execute(sql, params)]
+
+
 def search_nodes(
     conn: sqlite3.Connection,
     query: str,
@@ -681,223 +848,27 @@ def search_nodes(
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     tokens = query_tokens(query)
-    use_structured_fts_probes = len(tokens) <= STRUCTURED_FTS_TOKEN_LIMIT
-    strict_fts = fts_query_from_tokens(tokens, operator="") if use_structured_fts_probes else ""
+    use_strict = len(tokens) <= STRUCTURED_FTS_TOKEN_LIMIT
+    strict_fts = fts_query_from_tokens(tokens, operator="") if use_strict else ""
     broad_fts = fts_query_from_tokens(tokens)
-    path_fts = path_fts_query_from_tokens(tokens) if use_structured_fts_probes else ""
-    column_fts = column_fts_query_from_tokens(tokens) if use_structured_fts_probes else ""
+
     if strict_fts or broad_fts:
         candidates: list[dict[str, Any]] = []
-        if path_fts:
-            try:
-                if repo_id:
-                    path_rows = conn.execute(
-                        """
-                        SELECT n.*, 0.0 AS rank
-                        FROM node_fts
-                        JOIN nodes n ON n.id = node_fts.node_id
-                        WHERE node_fts MATCH ?
-                          AND n.repo_id = ?
-                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                        LIMIT ?
-                        """,
-                        (path_fts, repo_id, limit),
-                    )
-                else:
-                    path_rows = conn.execute(
-                        """
-                        SELECT n.*, 0.0 AS rank
-                        FROM node_fts
-                        JOIN nodes n ON n.id = node_fts.node_id
-                        WHERE node_fts MATCH ?
-                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                        LIMIT ?
-                        """,
-                        (path_fts, limit),
-                    )
-                candidates.extend(row_to_node_dict(row) for row in path_rows)
-            except sqlite3.OperationalError:
-                pass
-
-        if unique_node_count(candidates, limit) < max(1, limit // 2):
-            candidates = []
-
-        column_candidates: list[dict[str, Any]] = []
-        if column_fts and not candidates:
-            try:
-                if repo_id:
-                    column_rows = conn.execute(
-                        """
-                        SELECT n.*, 0.0 AS rank
-                        FROM node_fts
-                        JOIN nodes n ON n.id = node_fts.node_id
-                        WHERE node_fts MATCH ?
-                          AND n.repo_id = ?
-                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                        LIMIT ?
-                        """,
-                        (column_fts, repo_id, limit),
-                    )
-                else:
-                    column_rows = conn.execute(
-                        """
-                        SELECT n.*, 0.0 AS rank
-                        FROM node_fts
-                        JOIN nodes n ON n.id = node_fts.node_id
-                        WHERE node_fts MATCH ?
-                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                        LIMIT ?
-                        """,
-                        (column_fts, limit),
-                    )
-                column_candidates = [row_to_node_dict(row) for row in column_rows]
-                if unique_node_count(column_candidates, limit) >= limit:
-                    candidates = column_candidates
-            except sqlite3.OperationalError:
-                pass
-
-        if strict_fts and not candidates:
-            try:
-                if repo_id:
-                    strict_rows = conn.execute(
-                        """
-                        SELECT n.*, bm25(node_fts) AS rank
-                        FROM node_fts
-                        JOIN nodes n ON n.id = node_fts.node_id
-                        WHERE node_fts MATCH ?
-                          AND n.repo_id = ?
-                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                        ORDER BY rank
-                        LIMIT ?
-                        """,
-                        (strict_fts, repo_id, limit),
-                    )
-                else:
-                    strict_rows = conn.execute(
-                        """
-                        SELECT n.*, bm25(node_fts) AS rank
-                        FROM node_fts
-                        JOIN nodes n ON n.id = node_fts.node_id
-                        WHERE node_fts MATCH ?
-                          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                        ORDER BY rank
-                        LIMIT ?
-                        """,
-                        (strict_fts, limit),
-                    )
-                candidates.extend(row_to_node_dict(row) for row in strict_rows)
-            except sqlite3.OperationalError:
-                pass
-
+        if strict_fts:
+            candidates.extend(_run_fts_bm25(conn, strict_fts, repo_id, limit, rank_bias=-25.0))
         if broad_fts and broad_fts != strict_fts and unique_node_count(candidates, limit) < limit:
-            try:
-                current_count = unique_node_count(candidates, limit)
-                if current_count < max(1, limit // 2) and column_fts:
-                    if column_candidates:
-                        candidates.extend(column_candidates)
-                    else:
-                        fill_limit = limit
-                        if repo_id:
-                            column_rows = conn.execute(
-                                """
-                                SELECT n.*, 0.0 AS rank
-                                FROM node_fts
-                                JOIN nodes n ON n.id = node_fts.node_id
-                                WHERE node_fts MATCH ?
-                                  AND n.repo_id = ?
-                                  AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                                LIMIT ?
-                                """,
-                                (column_fts, repo_id, fill_limit),
-                            )
-                        else:
-                            column_rows = conn.execute(
-                                """
-                                SELECT n.*, 0.0 AS rank
-                                FROM node_fts
-                                JOIN nodes n ON n.id = node_fts.node_id
-                                WHERE node_fts MATCH ?
-                                  AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                                LIMIT ?
-                                """,
-                                (column_fts, fill_limit),
-                            )
-                        candidates.extend(row_to_node_dict(row) for row in column_rows)
-                current_count = unique_node_count(candidates, limit)
-                if current_count < limit:
-                    if current_count >= max(1, limit // 2):
-                        fill_limit = max(1, limit - current_count + 2)
-                    else:
-                        fill_limit = limit
-                    if repo_id:
-                        broad_rows = conn.execute(
-                            """
-                            SELECT n.*, 0.0 AS rank
-                            FROM node_fts
-                            JOIN nodes n ON n.id = node_fts.node_id
-                            WHERE node_fts MATCH ?
-                              AND n.repo_id = ?
-                              AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                            LIMIT ?
-                            """,
-                            (broad_fts, repo_id, fill_limit),
-                        )
-                    else:
-                        broad_rows = conn.execute(
-                            """
-                            SELECT n.*, 0.0 AS rank
-                            FROM node_fts
-                            JOIN nodes n ON n.id = node_fts.node_id
-                            WHERE node_fts MATCH ?
-                              AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency')
-                            LIMIT ?
-                            """,
-                            (broad_fts, fill_limit),
-                        )
-                    candidates.extend(row_to_node_dict(row) for row in broad_rows)
-            except sqlite3.OperationalError:
-                pass
+            candidates.extend(_run_fts_bm25(conn, broad_fts, repo_id, limit))
 
         results = stable_search_results(candidates, limit)
-
         seen_ids = {str(node["id"]) for node in results}
         if len(results) < limit and broad_fts:
             fill_limit = limit - len(results)
             external_rows = external_node_like_rows(conn, query, repo_id, fill_limit, tokens)
             append_unique_nodes(external_rows, results, seen_ids, limit)
-
         if results:
             return results
 
-    like = f"%{query}%"
-    if repo_id:
-        rows = conn.execute(
-            """
-            SELECT *, 0.0 AS rank FROM nodes
-            WHERE repo_id = ? AND (qname LIKE ? OR name LIKE ? OR path LIKE ? OR doc LIKE ?)
-            ORDER BY
-              CASE WHEN kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
-              CASE WHEN name = ? THEN 0 ELSE 1 END,
-              length(qname)
-            LIMIT ?
-            """,
-            (repo_id, like, like, like, like, query, limit),
-        )
-    else:
-        rows = conn.execute(
-            """
-            SELECT *, 0.0 AS rank FROM nodes
-            WHERE qname LIKE ? OR name LIKE ? OR path LIKE ? OR doc LIKE ?
-            ORDER BY
-              CASE WHEN kind IN ('ExternalSymbol', 'ExternalDependency') THEN 1 ELSE 0 END,
-              CASE WHEN name = ? THEN 0 ELSE 1 END,
-              length(qname)
-            LIMIT ?
-            """,
-            (like, like, like, like, query, limit),
-        )
-    results = [row_to_node_dict(row) for row in rows]
-    return results
+    return _like_search_nodes(conn, query, repo_id, limit)
 
 
 def find_symbol(

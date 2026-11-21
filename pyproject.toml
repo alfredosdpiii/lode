@@ -80,7 +80,7 @@ exclude_dirs = ["tests", ".venv"]
 skips = ["B101", "B310", "B324", "B404", "B603", "B607", "B608"]
 
 [tool.deptry]
-extend_exclude = ["tests", ".venv", "dist", "build"]
+extend_exclude = ["tests", ".venv", "dist", "build", "rust"]
 known_first_party = ["lode"]
 
 [dependency-groups]

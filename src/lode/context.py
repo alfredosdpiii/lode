@@ -1,9 +1,22 @@
 from __future__ import annotations
 
+import math
+import re
 import sqlite3
+from pathlib import PurePosixPath
 from typing import Any
 
-from .storage import repo_filter, search_nodes
+from .storage import (
+    ENGLISH_STOPWORDS,
+    PYTHON_KEYWORD_STOPWORDS,
+    repo_filter,
+    row_to_node_dict,
+    search_nodes,
+)
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+_CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
+_CONTEXT_STOPWORDS = PYTHON_KEYWORD_STOPWORDS | ENGLISH_STOPWORDS | {"py", "ts", "js"}
 
 
 def build_context_pack(
@@ -13,9 +26,21 @@ def build_context_pack(
     budget: int = 6000,
     limit: int = 10,
     include_related: bool = True,
+    from_path: str | None = None,
+    exclude_paths: set[str] | None = None,
 ) -> dict[str, Any]:
     repo_id = repo_filter(conn, repo_path)
-    hits = sorted(search_nodes(conn, query, repo_id=repo_id, limit=limit), key=context_rank)
+    excluded = set(exclude_paths) if exclude_paths else set()
+    fetch_limit = max(limit * 3, limit + len(excluded) + 10)
+    raw_hits = search_nodes(conn, query, repo_id=repo_id, limit=fetch_limit)
+
+    graph_boosts, graph_nodes = _graph_context_signals(
+        conn, repo_id, from_path, raw_hits, excluded, limit
+    )
+    hits = _merge_and_rank_hits(
+        query, raw_hits, graph_boosts, graph_nodes, from_path, excluded, limit
+    )
+
     must_read: list[dict[str, Any]] = []
     seen_paths: set[tuple[str, int, int]] = set()
     remaining = max(1000, budget)
@@ -57,10 +82,266 @@ def build_context_pack(
         "related": related,
         "confidence": aggregate_confidence(hits),
         "notes": [
-            "Lode ranks exact/FTS matches first, then expands graph neighbors.",
+            "Lode ranks weighted BM25 matches with identifier specificity and graph proximity.",
             "Embeddings are optional and not required for this context pack yet.",
         ],
     }
+
+
+def _graph_context_signals(
+    conn: sqlite3.Connection,
+    repo_id: str | None,
+    from_path: str | None,
+    raw_hits: list[dict[str, Any]],
+    excluded: set[str],
+    limit: int,
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    if not from_path:
+        return {}, []
+    boosts: dict[str, float] = {}
+    extra_nodes: list[dict[str, Any]] = []
+    seen_ids: set[str] = {str(hit["id"]) for hit in raw_hits}
+
+    edge_rows = _load_from_path_targets(conn, repo_id, from_path, max(limit * 2, 24))
+    for edge_kind, confidence, node in edge_rows:
+        path = str(node.get("path") or "")
+        if not path or path in excluded:
+            continue
+        weight = _edge_boost_weight(edge_kind, confidence)
+        node_id = str(node["id"])
+        boosts[node_id] = max(boosts.get(node_id, 0.0), weight)
+        boosts[f"path:{path}"] = max(boosts.get(f"path:{path}", 0.0), weight * 0.75)
+        if node_id not in seen_ids:
+            seen_ids.add(node_id)
+            extra_nodes.append(node)
+    return boosts, extra_nodes
+
+
+def _load_from_path_targets(
+    conn: sqlite3.Connection,
+    repo_id: str | None,
+    from_path: str,
+    limit: int,
+) -> list[tuple[str, str, dict[str, Any]]]:
+    repo_clause = "AND e.repo_id = ?" if repo_id else ""
+    sql = f"""
+        SELECT e.kind AS edge_kind, e.confidence AS edge_confidence, n.*
+        FROM edges e
+        JOIN nodes src ON src.repo_id = e.repo_id AND src.id = e.src
+        JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.dst
+        WHERE src.path = ?
+          {repo_clause}
+          AND n.path != ?
+          AND n.kind NOT IN ('ExternalSymbol', 'ExternalDependency', 'ParseError')
+          AND e.kind IN ('CALLS', 'IMPORTS', 'EXTENDS')
+        ORDER BY
+          CASE e.kind WHEN 'CALLS' THEN 0 WHEN 'EXTENDS' THEN 1 ELSE 2 END,
+          CASE e.confidence WHEN 'exact' THEN 0 WHEN 'strong' THEN 1 WHEN 'resolved' THEN 2 ELSE 3 END,
+          n.path,
+          n.start_line
+        LIMIT ?
+    """  # nosec B608
+    params: tuple[Any, ...] = (
+        (from_path, repo_id, from_path, limit) if repo_id else (from_path, from_path, limit)
+    )
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for row in conn.execute(sql, params):
+        node = row_to_node_dict(row)
+        node["rank"] = 0.0
+        out.append((str(row["edge_kind"]), str(row["edge_confidence"]), node))
+    return out
+
+
+def _edge_boost_weight(edge_kind: str, confidence: str) -> float:
+    kind_base = {"CALLS": 4.0, "EXTENDS": 4.0, "IMPORTS": 3.5}.get(edge_kind, 2.0)
+    conf_scale = {"exact": 1.0, "strong": 1.0, "resolved": 0.9, "heuristic": 0.6}.get(
+        confidence, 0.5
+    )
+    return kind_base * conf_scale
+
+
+def _merge_and_rank_hits(
+    query: str,
+    raw_hits: list[dict[str, Any]],
+    graph_boosts: dict[str, float],
+    graph_nodes: list[dict[str, Any]],
+    from_path: str | None,
+    excluded: set[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    query_weights, exact_terms = _query_term_weights(query)
+    from_parts = _path_dir_parts(from_path) if from_path else ()
+    merged = _dedupe_candidate_nodes((*raw_hits, *graph_nodes), excluded)
+    if not merged:
+        return []
+
+    node_fields = [_extract_node_fields(node) for node in merged]
+    term_idf = _candidate_pool_idf(node_fields)
+    scored = [
+        (
+            _composite_rank(
+                node, fields, query_weights, exact_terms, term_idf, graph_boosts, from_parts
+            ),
+            node,
+        )
+        for node, fields in zip(merged, node_fields, strict=True)
+    ]
+    scored.sort(key=lambda pair: pair[0])
+    return _diversify_by_path([node for _, node in scored], limit)
+
+
+def _dedupe_candidate_nodes(
+    nodes: tuple[dict[str, Any], ...], excluded: set[str]
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for node in nodes:
+        node_id = str(node.get("id") or "")
+        path = str(node.get("path") or "")
+        if not node_id or node_id in seen_ids or path in excluded:
+            continue
+        seen_ids.add(node_id)
+        merged.append(node)
+    return merged
+
+
+def _diversify_by_path(nodes: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    primary: list[dict[str, Any]] = []
+    overflow: list[dict[str, Any]] = []
+    per_path: dict[str, int] = {}
+    for node in nodes:
+        path = str(node.get("path") or "")
+        count = per_path.get(path, 0)
+        if count < 2:
+            primary.append(node)
+            per_path[path] = count + 1
+        else:
+            overflow.append(node)
+    return (primary + overflow)[:limit]
+
+
+def _extract_node_fields(node: dict[str, Any]) -> tuple[set[str], set[str], set[str], set[str]]:
+    name_raw = str(node.get("name") or "")
+    path_raw = str(node.get("path") or "")
+    sig_raw = str(node.get("signature") or "")
+    exact = {tok.lower() for tok in _TOKEN_RE.findall(f"{name_raw} {sig_raw}") if len(tok) > 1}
+    return (
+        _field_token_set(name_raw),
+        _field_token_set(path_raw),
+        _field_token_set(sig_raw),
+        exact,
+    )
+
+
+def _candidate_pool_idf(
+    node_fields: list[tuple[set[str], set[str], set[str], set[str]]],
+) -> dict[str, float]:
+    total = len(node_fields)
+    if total <= 1:
+        return {}
+    doc_freq: dict[str, int] = {}
+    for name_toks, path_toks, sig_toks, _ in node_fields:
+        for tok in name_toks | path_toks | sig_toks:
+            doc_freq[tok] = doc_freq.get(tok, 0) + 1
+    return {tok: math.log((total + 1.0) / (df + 0.5)) + 0.5 for tok, df in doc_freq.items()}
+
+
+def _composite_rank(
+    node: dict[str, Any],
+    fields: tuple[set[str], set[str], set[str], set[str]],
+    query_weights: dict[str, float],
+    exact_terms: dict[str, float],
+    term_idf: dict[str, float],
+    graph_boosts: dict[str, float],
+    from_parts: tuple[str, ...],
+) -> tuple[int, float, str]:
+    kind_penalty = 1 if node.get("kind") in {"ExternalSymbol", "ExternalDependency"} else 0
+    base_rank = float(node.get("rank") or 0.0)
+    node_id = str(node.get("id") or "")
+    path = str(node.get("path") or "")
+    boost = graph_boosts.get(node_id, 0.0) + graph_boosts.get(f"path:{path}", 0.0)
+    boost += _lexical_specificity_boost(fields, query_weights, exact_terms, term_idf)
+    if from_parts and path:
+        boost += _path_proximity_boost(from_parts, _path_dir_parts(path))
+    return (kind_penalty, base_rank - boost, str(node.get("qname") or ""))
+
+
+def _query_term_weights(query: str) -> tuple[dict[str, float], dict[str, float]]:
+    weights: dict[str, float] = {}
+    exact_weights: dict[str, float] = {}
+    pos = 0
+    for raw in _TOKEN_RE.findall(query):
+        low_raw = raw.lower()
+        if low_raw not in _CONTEXT_STOPWORDS and len(low_raw) > 1:
+            exact_weights[low_raw] = max(exact_weights.get(low_raw, 0.0), 1.0 / (1.0 + 0.22 * pos))
+        for token in _expand_token(raw):
+            if token in _CONTEXT_STOPWORDS or len(token) <= 1:
+                continue
+            w = 1.0 / (1.0 + 0.25 * pos)
+            if w > weights.get(token, 0.0):
+                weights[token] = w
+            pos += 1
+            if pos >= 48:
+                return weights, exact_weights
+    return weights, exact_weights
+
+
+def _expand_token(raw: str) -> list[str]:
+    low_raw = raw.lower()
+    out = [low_raw]
+    for chunk in raw.split("_"):
+        if not chunk:
+            continue
+        out.extend(p.lower() for p in _CAMEL_RE.findall(chunk) if p.lower() != low_raw)
+    return out
+
+
+def _field_token_set(value: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in _TOKEN_RE.findall(value):
+        tokens.update(_expand_token(raw))
+    return tokens
+
+
+def _lexical_specificity_boost(
+    fields: tuple[set[str], set[str], set[str], set[str]],
+    query_weights: dict[str, float],
+    exact_terms: dict[str, float],
+    term_idf: dict[str, float],
+) -> float:
+    if not query_weights:
+        return 0.0
+    name_tokens, path_tokens, sig_tokens, exact_tokens = fields
+    boost = 0.0
+    for term, weight in exact_terms.items():
+        if term in exact_tokens:
+            boost += 5.0 * weight * term_idf.get(term, 1.5)
+    for term, weight in query_weights.items():
+        idf = term_idf.get(term, 1.5)
+        if term in name_tokens:
+            boost += 3.5 * weight * idf
+        if term in path_tokens:
+            boost += 3.0 * weight * idf
+        if term in sig_tokens:
+            boost += 1.5 * weight * idf
+    return boost
+
+
+def _path_dir_parts(path: str) -> tuple[str, ...]:
+    return PurePosixPath(path).parent.parts
+
+
+def _path_proximity_boost(from_parts: tuple[str, ...], cand_parts: tuple[str, ...]) -> float:
+    if not from_parts or not cand_parts:
+        return 0.0
+    shared = 0
+    for a, b in zip(from_parts, cand_parts, strict=False):
+        if a != b:
+            break
+        shared += 1
+    if shared == 0:
+        return 0.0
+    return 4.0 if from_parts == cand_parts else min(3.0, 1.0 * shared)
 
 
 def context_item(node: dict[str, Any], why: str) -> dict[str, Any]:
@@ -159,7 +440,7 @@ def load_compact_neighbor_rows(
           CASE e.confidence WHEN 'resolved' THEN 0 WHEN 'strong' THEN 1 ELSE 2 END,
           n.path,
           n.start_line
-        """
+        """  # nosec B608
     else:
         sql = f"""
         SELECT e.dst AS center_id,
@@ -177,7 +458,7 @@ def load_compact_neighbor_rows(
           CASE e.confidence WHEN 'resolved' THEN 0 WHEN 'strong' THEN 1 ELSE 2 END,
           n.path,
           n.start_line
-        """
+        """  # nosec B608
     row_factory = conn.row_factory
     conn.row_factory = None
     try:
