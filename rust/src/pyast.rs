@@ -1,8 +1,10 @@
 //! Python source extraction on top of `ruff_python_parser`, reproducing what `indexer.py`
 //! reads from CPython's `ast` module: top-level definitions, docstrings, imports and calls.
 
+use std::collections::BTreeMap;
+
 use ruff_python_ast::visitor::{self, Visitor};
-use ruff_python_ast::{self as ast, Expr, Stmt};
+use ruff_python_ast::{self as ast, Expr, Operator, Stmt};
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextSize};
 
@@ -254,6 +256,241 @@ pub fn dotted_name(expr: &Expr) -> String {
         Expr::Subscript(sub) => dotted_name(&sub.value),
         _ => String::new(),
     }
+}
+
+/// Extract a receiver type name from a Python type annotation, unwrapping `Optional[T]`,
+/// `T | None`, `Union[T, None]`, `Annotated[T, ...]`, and string forward references.
+pub fn annotation_type_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Name(name) => {
+            let id = name.id.as_str();
+            if id == "None" {
+                String::new()
+            } else {
+                id.to_owned()
+            }
+        }
+        Expr::Attribute(_) => dotted_name(expr),
+        Expr::StringLiteral(lit) => {
+            let raw = lit.value.to_str().trim();
+            if !raw.is_empty()
+                && raw
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
+            {
+                raw.to_owned()
+            } else {
+                String::new()
+            }
+        }
+        Expr::BinOp(bin) if bin.op == Operator::BitOr => {
+            let left = annotation_type_name(&bin.left);
+            let right = annotation_type_name(&bin.right);
+            match (left.is_empty(), right.is_empty()) {
+                (false, true) => left,
+                (true, false) => right,
+                _ => String::new(),
+            }
+        }
+        Expr::Subscript(sub) => {
+            let outer = dotted_name(&sub.value);
+            let leaf = outer.rsplit('.').next().unwrap_or(&outer);
+            match leaf {
+                "Optional" => annotation_type_name(&sub.slice),
+                "Annotated" => match sub.slice.as_ref() {
+                    Expr::Tuple(tuple) => tuple
+                        .elts
+                        .first()
+                        .map_or_else(String::new, annotation_type_name),
+                    other => annotation_type_name(other),
+                },
+                "Union" => match sub.slice.as_ref() {
+                    Expr::Tuple(tuple) => {
+                        let non_empty: Vec<String> = tuple
+                            .elts
+                            .iter()
+                            .map(annotation_type_name)
+                            .filter(|name| !name.is_empty())
+                            .collect();
+                        if non_empty.len() == 1 {
+                            non_empty.into_iter().next().unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    }
+                    other => annotation_type_name(other),
+                },
+                _ => outer,
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn receiver_target_key(target: &Expr) -> Option<String> {
+    match target {
+        Expr::Name(name) => Some(name.id.to_string()),
+        Expr::Attribute(attr) => match attr.value.as_ref() {
+            Expr::Name(base) if matches!(base.id.as_str(), "self" | "cls") => {
+                Some(format!("self.{}", attr.attr.id))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn call_callee_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Call(call) => {
+            let callee = dotted_name(&call.func);
+            (!callee.is_empty()).then_some(callee)
+        }
+        _ => None,
+    }
+}
+
+fn collect_stmt_receivers(stmts: &[Stmt], out: &mut BTreeMap<String, String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::AnnAssign(assign) => {
+                if let Some(key) = receiver_target_key(&assign.target) {
+                    let ty = annotation_type_name(&assign.annotation);
+                    if !ty.is_empty() {
+                        out.insert(key, ty);
+                    } else if let Some(val) = assign.value.as_deref().and_then(call_callee_name) {
+                        out.insert(key, val);
+                    }
+                }
+            }
+            Stmt::Assign(assign) => {
+                if let Some(val) = call_callee_name(&assign.value) {
+                    for target in &assign.targets {
+                        if let Some(key) = receiver_target_key(target) {
+                            out.insert(key, val.clone());
+                        }
+                    }
+                }
+            }
+            Stmt::With(with_stmt) => {
+                for item in &with_stmt.items {
+                    if let Some(target) = item.optional_vars.as_deref()
+                        && let Some(key) = receiver_target_key(target)
+                        && let Some(val) = call_callee_name(&item.context_expr)
+                    {
+                        out.insert(key, val);
+                    }
+                }
+                collect_stmt_receivers(&with_stmt.body, out);
+            }
+            Stmt::If(if_stmt) => {
+                collect_stmt_receivers(&if_stmt.body, out);
+                for clause in &if_stmt.elif_else_clauses {
+                    collect_stmt_receivers(&clause.body, out);
+                }
+            }
+            Stmt::For(for_stmt) => {
+                collect_stmt_receivers(&for_stmt.body, out);
+                collect_stmt_receivers(&for_stmt.orelse, out);
+            }
+            Stmt::While(while_stmt) => {
+                collect_stmt_receivers(&while_stmt.body, out);
+                collect_stmt_receivers(&while_stmt.orelse, out);
+            }
+            Stmt::Try(try_stmt) => {
+                collect_stmt_receivers(&try_stmt.body, out);
+                for handler in &try_stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    collect_stmt_receivers(&h.body, out);
+                }
+                collect_stmt_receivers(&try_stmt.orelse, out);
+                collect_stmt_receivers(&try_stmt.finalbody, out);
+            }
+            Stmt::Match(match_stmt) => {
+                for case in &match_stmt.cases {
+                    collect_stmt_receivers(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Local variable and `self.<attr>` type bindings for a Python function or method.
+pub fn collect_function_receivers(def: &ast::StmtFunctionDef) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let params = &def.parameters;
+    for param in params
+        .posonlyargs
+        .iter()
+        .chain(&params.args)
+        .chain(&params.kwonlyargs)
+    {
+        if let Some(ann) = param.parameter.annotation.as_deref() {
+            let ty = annotation_type_name(ann);
+            if !ty.is_empty() {
+                out.insert(param.parameter.name.id.to_string(), ty);
+            }
+        }
+    }
+    for extra in [&params.vararg, &params.kwarg].into_iter().flatten() {
+        if let Some(ann) = extra.annotation.as_deref() {
+            let ty = annotation_type_name(ann);
+            if !ty.is_empty() {
+                out.insert(extra.name.id.to_string(), ty);
+            }
+        }
+    }
+    collect_stmt_receivers(&def.body, &mut out);
+    out
+}
+
+/// Module-level variable type bindings (top-level assignments and annotations).
+pub fn collect_module_receivers(body: &[Stmt]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    collect_stmt_receivers(body, &mut out);
+    out.retain(|key, _| !key.starts_with("self."));
+    out
+}
+
+/// Class attribute type bindings from class body annotations/assignments and `self.<attr>` in methods.
+pub fn collect_class_attr_types(class: &ast::StmtClassDef) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut class_body = BTreeMap::new();
+    collect_stmt_receivers(&class.body, &mut class_body);
+    for (key, value) in class_body {
+        if !key.starts_with("self.") {
+            out.insert(key, value);
+        }
+    }
+    // Non-__init__ methods first so __init__ bindings take precedence.
+    for stmt in &class.body {
+        if let Stmt::FunctionDef(def) = stmt
+            && def.name.id.as_str() != "__init__"
+        {
+            let mut local = BTreeMap::new();
+            collect_stmt_receivers(&def.body, &mut local);
+            for (key, value) in local {
+                if let Some(attr) = key.strip_prefix("self.") {
+                    out.entry(attr.to_owned()).or_insert(value);
+                }
+            }
+        }
+    }
+    for stmt in &class.body {
+        if let Stmt::FunctionDef(def) = stmt
+            && def.name.id.as_str() == "__init__"
+        {
+            let mut local = BTreeMap::new();
+            collect_stmt_receivers(&def.body, &mut local);
+            for (key, value) in local {
+                if let Some(attr) = key.strip_prefix("self.") {
+                    out.insert(attr.to_owned(), value);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `ast.get_docstring(node)` with `clean=True`.

@@ -374,3 +374,170 @@ fn impact_report_filters_resolved_external_placeholder() {
     assert!(kinds.contains(&"Function"));
     assert!(!kinds.contains(&"ExternalSymbol"));
 }
+
+#[test]
+fn receiver_assignment_and_annotation_disambiguate_methods() {
+    let fx = Fixture::new();
+    fx.write(
+        "a.py",
+        "class A:\n    def save(self):\n        return 'a'\n",
+    );
+    fx.write(
+        "b.py",
+        "class B:\n    def save(self):\n        return 'b'\n",
+    );
+    fx.write(
+        "consumer.py",
+        "from typing import Optional\nfrom a import A\nfrom b import B\n\n\
+         def via_ctor():\n    svc = A()\n    return svc.save()\n\n\
+         def via_param(svc: Optional[B]):\n    return svc.save()\n\n\
+         def via_ann(factory):\n    svc: A = factory()\n    return svc.save()\n",
+    );
+    let stats = fx.index();
+    let conn = fx.conn();
+    let a_save = by_qname(&conn, "save", "a.A.save");
+    let b_save = by_qname(&conn, "save", "b.B.save");
+    let via_ctor = first(&conn, "via_ctor");
+    let via_param = first(&conn, "via_param");
+    let via_ann = first(&conn, "via_ann");
+    assert_eq!(
+        resolved_calls(&conn, &stats.repo_id, Some(&via_ctor.id), Some(&a_save.id)),
+        1
+    );
+    assert_eq!(
+        resolved_calls(&conn, &stats.repo_id, Some(&via_ctor.id), Some(&b_save.id)),
+        0
+    );
+    assert_eq!(
+        resolved_calls(&conn, &stats.repo_id, Some(&via_param.id), Some(&b_save.id)),
+        1
+    );
+    assert_eq!(
+        resolved_calls(&conn, &stats.repo_id, Some(&via_ann.id), Some(&a_save.id)),
+        1
+    );
+}
+
+#[test]
+fn self_attr_and_inherited_methods_resolve() {
+    let fx = Fixture::new();
+    fx.write(
+        "base.py",
+        "class Base:\n    def execute(self):\n        return 1\n",
+    );
+    fx.write(
+        "other.py",
+        "class Other:\n    def execute(self):\n        return 2\n",
+    );
+    fx.write(
+        "app.py",
+        "from base import Base\n\n\
+         class Sub(Base):\n    def run(self):\n        return self.execute()\n\n\
+         class Controller:\n    def __init__(self):\n        self.worker = Sub()\n    \
+         def handle(self):\n        return self.worker.execute()\n",
+    );
+    let stats = fx.index();
+    let conn = fx.conn();
+    let base_exec = by_qname(&conn, "execute", "base.Base.execute");
+    let other_exec = by_qname(&conn, "execute", "other.Other.execute");
+    let sub_run = by_qname(&conn, "run", "app.Sub.run");
+    let handle = by_qname(&conn, "handle", "app.Controller.handle");
+    assert_eq!(
+        resolved_calls(
+            &conn,
+            &stats.repo_id,
+            Some(&sub_run.id),
+            Some(&base_exec.id)
+        ),
+        1
+    );
+    assert_eq!(
+        resolved_calls(&conn, &stats.repo_id, Some(&handle.id), Some(&base_exec.id)),
+        1
+    );
+    assert_eq!(
+        resolved_calls(&conn, &stats.repo_id, None, Some(&other_exec.id)),
+        0
+    );
+}
+
+#[test]
+fn dotted_call_on_unknown_receiver_does_not_false_match_unique_method() {
+    let fx = Fixture::new();
+    fx.write(
+        "store.py",
+        "class LocalStore:\n    def execute(self):\n        return 1\n",
+    );
+    fx.write(
+        "db.py",
+        "import sqlite3\n\ndef query(conn):\n    return conn.execute('SELECT 1')\n",
+    );
+    let stats = fx.index();
+    let conn = fx.conn();
+    let query = first(&conn, "query");
+    let store_exec = by_qname(&conn, "execute", "store.LocalStore.execute");
+    assert_eq!(
+        resolved_calls(&conn, &stats.repo_id, Some(&query.id), Some(&store_exec.id)),
+        0
+    );
+}
+
+#[test]
+fn blast_radius_filters_unrelated_named_imports() {
+    let fx = Fixture::new();
+    fx.write(
+        "utils.py",
+        "def helper_a():\n    return 'a'\n\ndef helper_b():\n    return 'b'\n",
+    );
+    fx.write(
+        "uses_a.py",
+        "from utils import helper_a\n\ndef run_a():\n    return helper_a()\n",
+    );
+    fx.write(
+        "uses_b.py",
+        "from utils import helper_b\n\ndef run_b():\n    return helper_b()\n",
+    );
+    fx.write(
+        "uses_mod.py",
+        "import utils\n\ndef run_mod():\n    return utils.helper_b()\n",
+    );
+    fx.index();
+    let conn = fx.conn();
+    let helper_b = first(&conn, "helper_b");
+    let result = blast_radius(&conn, &helper_b.id, None, 1000, Direction::Up).unwrap();
+    let files: Vec<&str> = result["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(files.contains(&"uses_b.py"), "{files:?}");
+    assert!(files.contains(&"uses_mod.py"), "{files:?}");
+    assert!(!files.contains(&"uses_a.py"), "{files:?}");
+}
+
+#[test]
+fn blast_radius_does_not_cascade_transitive_file_imports_for_symbol() {
+    let fx = Fixture::new();
+    fx.write("leaf.py", "def target_fn():\n    return 1\n");
+    fx.write(
+        "mid.py",
+        "import leaf\n\ndef unrelated_mid():\n    return 2\n",
+    );
+    fx.write(
+        "top.py",
+        "from mid import unrelated_mid\n\ndef entry():\n    return unrelated_mid()\n",
+    );
+    fx.index();
+    let conn = fx.conn();
+    let target = first(&conn, "target_fn");
+    let result = blast_radius(&conn, &target.id, None, 1000, Direction::Up).unwrap();
+    let files: Vec<&str> = result["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(files.contains(&"mid.py"), "{files:?}");
+    assert!(!files.contains(&"top.py"), "{files:?}");
+}

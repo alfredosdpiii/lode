@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod embeddings;
 pub mod error;
 pub mod features;
+pub mod gitignore;
 pub mod graph;
 pub mod indexer;
 pub mod json;

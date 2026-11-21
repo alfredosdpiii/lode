@@ -897,3 +897,43 @@ fn deleted_nodes_do_not_leave_embedding_artifacts() {
         }
     }
 }
+
+#[test]
+fn gitignored_files_and_directories_are_skipped() {
+    let fx = Fixture::new();
+    fx.write(
+        ".gitignore",
+        "ignored_dir/\n*.tmp.py\n!keep.tmp.py\n/root_skip.py\n",
+    );
+    fx.write("app.py", "def ok():\n    return 1\n");
+    fx.write("root_skip.py", "def skipped():\n    return 2\n");
+    fx.write("sub/root_skip.py", "def kept():\n    return 3\n");
+    fx.write("drop.tmp.py", "def dropped():\n    return 4\n");
+    fx.write("keep.tmp.py", "def unignored():\n    return 5\n");
+    fx.write("ignored_dir/dump.py", "def buried():\n    return 6\n");
+    fx.write("sub/.gitignore", "local_ignore.py\n");
+    fx.write("sub/local_ignore.py", "def local_skip():\n    return 7\n");
+
+    let paths: Vec<String> = iter_source_files(fx.repo())
+        .into_iter()
+        .map(|p| {
+            p.strip_prefix(fx.repo())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    assert!(paths.contains(&"app.py".to_owned()), "{paths:?}");
+    assert!(paths.contains(&"sub/root_skip.py".to_owned()), "{paths:?}");
+    assert!(paths.contains(&"keep.tmp.py".to_owned()), "{paths:?}");
+    assert!(!paths.contains(&"root_skip.py".to_owned()), "{paths:?}");
+    assert!(!paths.contains(&"drop.tmp.py".to_owned()), "{paths:?}");
+    assert!(
+        !paths.contains(&"ignored_dir/dump.py".to_owned()),
+        "{paths:?}"
+    );
+    assert!(
+        !paths.contains(&"sub/local_ignore.py".to_owned()),
+        "{paths:?}"
+    );
+}

@@ -237,16 +237,30 @@ struct Resolver {
     methods_by_class: HashMap<(String, String, String), Vec<usize>>,
     suffix_matches: HashMap<String, Vec<usize>>,
     aliases: HashMap<String, (AliasMap, Vec<String>)>,
+    file_receivers: HashMap<String, HashMap<String, String>>,
+    func_receivers: HashMap<String, HashMap<String, String>>,
+    class_attr_types: HashMap<(String, String), HashMap<String, String>>,
+    class_bases: HashMap<usize, Vec<String>>,
     defs: Vec<DefRow>,
     module_cache: HashMap<(String, String), Option<String>>,
     target_cache: HashMap<(String, String, bool, String), Option<usize>>,
 }
 
-/// Calling node of an unresolved CALLS edge, used for `self.method` lookups.
+/// Calling node of an unresolved CALLS edge, used for `self.method` and receiver lookups.
 struct Caller {
+    id: String,
     kind: String,
     qname: String,
     path: String,
+}
+
+fn parse_string_map(extra: &Map<String, Value>, key: &str) -> HashMap<String, String> {
+    let Some(Value::Object(obj)) = extra.get(key) else {
+        return HashMap::new();
+    };
+    obj.iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+        .collect()
 }
 
 fn pick_one(pool: &[usize], defs: &[DefRow], prefer: &[&str]) -> Option<usize> {
@@ -366,8 +380,61 @@ impl Resolver {
         None
     }
 
+    fn resolve_class(&mut self, caller_path: &str, expr: &str) -> Option<usize> {
+        let expr = expr.trim();
+        if expr.is_empty() {
+            return None;
+        }
+        // Prefer same-file class definitions before cross-file imports/unique fallback.
+        if !expr.contains('.')
+            && let Some(idx) = self.pick_def(Some(caller_path.to_owned()), expr, CLASS_KINDS)
+            && self.defs[idx].kind == "Class"
+        {
+            return Some(idx);
+        }
+        let idx = self.resolve_target(caller_path, expr, CLASS_KINDS, None)?;
+        (self.defs[idx].kind == "Class").then_some(idx)
+    }
+
+    fn resolve_method_on_class(
+        &mut self,
+        class_idx: usize,
+        method_name: &str,
+        prefer: &[&str],
+        depth: usize,
+    ) -> Option<usize> {
+        let (class_path, class_qname) = {
+            let def = &self.defs[class_idx];
+            (def.path.clone(), def.qname.clone())
+        };
+        let key = (class_path.clone(), class_qname, method_name.to_owned());
+        if let Some(methods) = self.methods_by_class.get(&key)
+            && let Some(found) = pick_one(methods, &self.defs, prefer)
+        {
+            return Some(found);
+        }
+        if depth >= 4 {
+            return None;
+        }
+        let bases = self
+            .class_bases
+            .get(&class_idx)
+            .cloned()
+            .unwrap_or_default();
+        for base in bases {
+            if let Some(base_idx) = self.resolve_class(&class_path, &base)
+                && base_idx != class_idx
+                && let Some(found) =
+                    self.resolve_method_on_class(base_idx, method_name, prefer, depth + 1)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     fn resolve_self_method(
-        &self,
+        &mut self,
         caller: Option<&Caller>,
         dotted: &str,
         prefer: &[&str],
@@ -381,12 +448,79 @@ impl Resolver {
             return None;
         }
         let class_qname = caller.qname.rsplit_once('.').map_or("", |(head, _)| head);
+        if let Some(&class_idx) = self.by_qname.get(class_qname) {
+            return self.resolve_method_on_class(class_idx, segments[1], prefer, 0);
+        }
         let key = (
             caller.path.clone(),
             class_qname.to_owned(),
             segments[1].to_owned(),
         );
         pick_one(self.methods_by_class.get(&key)?, &self.defs, prefer)
+    }
+
+    fn resolve_via_receiver(
+        &mut self,
+        caller_path: &str,
+        caller: Option<&Caller>,
+        dotted: &str,
+        prefer: &[&str],
+    ) -> Option<usize> {
+        let segments: Vec<&str> = dotted.split('.').collect();
+        if segments.len() < 2 {
+            return None;
+        }
+        // `self.<attr>.<method>`
+        if segments.len() == 3 && SELF_NAMES.contains(&segments[0]) {
+            let caller = caller?;
+            let attr = segments[1];
+            let method = segments[2];
+            let self_key = format!("self.{attr}");
+            let type_expr = self
+                .func_receivers
+                .get(&caller.id)
+                .and_then(|m| m.get(&self_key))
+                .cloned()
+                .or_else(|| {
+                    let class_qname = caller.qname.rsplit_once('.').map_or("", |(head, _)| head);
+                    self.class_attr_types
+                        .get(&(caller.path.clone(), class_qname.to_owned()))
+                        .and_then(|m| m.get(attr))
+                        .cloned()
+                })?;
+            let class_idx = self.resolve_class(caller_path, &type_expr)?;
+            return self.resolve_method_on_class(class_idx, method, prefer, 0);
+        }
+        if SELF_NAMES.contains(&segments[0]) {
+            return None;
+        }
+        let method = segments[segments.len() - 1];
+        // `<var>.<method>` via local function/method or module-level receiver bindings
+        if segments.len() == 2 {
+            let recv = segments[0];
+            let type_expr = caller
+                .and_then(|c| self.func_receivers.get(&c.id))
+                .and_then(|m| m.get(recv))
+                .cloned()
+                .or_else(|| {
+                    self.file_receivers
+                        .get(caller_path)
+                        .and_then(|m| m.get(recv))
+                        .cloned()
+                });
+            if let Some(type_expr) = type_expr
+                && let Some(class_idx) = self.resolve_class(caller_path, &type_expr)
+                && let Some(found) = self.resolve_method_on_class(class_idx, method, prefer, 0)
+            {
+                return Some(found);
+            }
+        }
+        // Direct class/constructor call chain: `UserService().create()` -> `"UserService.create"`
+        let prefix = segments[..segments.len() - 1].join(".");
+        if let Some(class_idx) = self.resolve_class(caller_path, &prefix) {
+            return self.resolve_method_on_class(class_idx, method, prefer, 0);
+        }
+        None
     }
 
     fn resolve_target(
@@ -403,8 +537,8 @@ impl Resolver {
         let first = dotted.split('.').next().unwrap_or_default();
         let is_self = SELF_NAMES.contains(&first);
         let context = match caller {
-            Some(caller) if is_self => caller.qname.clone(),
-            _ => String::new(),
+            Some(caller) => caller.id.clone(),
+            None => String::new(),
         };
         let key = (
             caller_path.to_owned(),
@@ -419,6 +553,9 @@ impl Resolver {
         if row.is_none() {
             row = self.resolve_self_method(caller, dotted, prefer);
         }
+        if row.is_none() && prefer != CLASS_KINDS {
+            row = self.resolve_via_receiver(caller_path, caller, dotted, prefer);
+        }
         if row.is_none() && !is_self {
             row = self.resolve_via_imports(caller_path, dotted, prefer);
         }
@@ -432,9 +569,11 @@ impl Resolver {
                 _ => None,
             };
         }
-        if row.is_none() && !is_self {
-            let simple = dotted.rsplit('.').next().unwrap_or(dotted);
-            if let Some(matches) = self.by_name.get(simple) {
+        // Only fall back to repo-wide unique bare name for unqualified calls (`foo()`),
+        // never for dotted attribute calls (`unknown_obj.execute()`), which otherwise
+        // falsely bind third-party/untyped calls to unrelated local methods.
+        if row.is_none() && !is_self && !dotted.contains('.') {
+            if let Some(matches) = self.by_name.get(dotted) {
                 row = pick_one(matches, &self.defs, prefer);
             }
         }
@@ -456,6 +595,7 @@ fn load_resolver(conn: &Connection, repo_id: &str) -> Result<(Resolver, RepoFact
         .collect::<rusqlite::Result<_>>()?;
     let mut file_nodes = HashMap::new();
     let mut imports_by_path = Vec::new();
+    let mut file_receivers = HashMap::new();
     {
         let mut stmt = conn.prepare(
             "SELECT id, path, extra_json FROM nodes WHERE repo_id = ? AND kind = 'File' ORDER BY rowid",
@@ -469,29 +609,83 @@ fn load_resolver(conn: &Connection, repo_id: &str) -> Result<(Resolver, RepoFact
         })?;
         for row in rows {
             let (id, path, extra) = row?;
-            if let Some(bindings) = parse_bindings(&decode_extra(&extra)) {
+            let decoded = decode_extra(&extra);
+            if let Some(bindings) = parse_bindings(&decoded) {
                 // A later row for the same path replaces the earlier one, like a dict.
                 imports_by_path.retain(|(p, _): &(String, Vec<ImportBinding>)| *p != path);
                 imports_by_path.push((path.clone(), bindings));
             }
+            let recvs = parse_string_map(&decoded, "receivers");
+            if !recvs.is_empty() {
+                file_receivers.insert(path.clone(), recvs);
+            }
             file_nodes.insert(path, id);
         }
     }
+    let mut func_receivers = HashMap::new();
+    let mut class_attr_types = HashMap::new();
+    let mut def_id_to_idx: HashMap<String, usize> = HashMap::new();
     let defs: Vec<DefRow> = conn
         .prepare(
-            "SELECT id, kind, name, qname, path FROM nodes
+            "SELECT id, kind, name, qname, path, extra_json FROM nodes
              WHERE repo_id = ? AND kind IN ('Function', 'Method', 'Class') ORDER BY rowid",
         )?
         .query_map([repo_id], |row| {
-            Ok(DefRow {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                name: row.get(2)?,
-                qname: row.get(3)?,
-                path: row.get(4)?,
-            })
+            Ok((
+                DefRow {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    name: row.get(2)?,
+                    qname: row.get(3)?,
+                    path: row.get(4)?,
+                },
+                row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            ))
         })?
-        .collect::<rusqlite::Result<_>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (def, extra))| {
+            let decoded = decode_extra(&extra);
+            if def.kind == "Class" {
+                let attrs = parse_string_map(&decoded, "attr_types");
+                if !attrs.is_empty() {
+                    class_attr_types.insert((def.path.clone(), def.qname.clone()), attrs);
+                }
+            } else {
+                let recvs = parse_string_map(&decoded, "receivers");
+                if !recvs.is_empty() {
+                    func_receivers.insert(def.id.clone(), recvs);
+                }
+            }
+            def_id_to_idx.insert(def.id.clone(), idx);
+            def
+        })
+        .collect();
+    let mut class_bases: HashMap<usize, Vec<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT e.src, COALESCE(NULLIF(e.detail, ''), target.name, '')
+             FROM edges e
+             JOIN nodes target ON target.repo_id = e.repo_id AND target.id = e.dst
+             WHERE e.repo_id = ? AND e.kind = 'EXTENDS'",
+        )?;
+        let rows = stmt.query_map([repo_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (src_id, base) = row?;
+            let base = base.trim();
+            if !base.is_empty()
+                && let Some(&idx) = def_id_to_idx.get(&src_id)
+            {
+                let entry = class_bases.entry(idx).or_default();
+                if !entry.iter().any(|b| b == base) {
+                    entry.push(base.to_owned());
+                }
+            }
+        }
+    }
     let mut resolver = Resolver {
         files: languages.keys().cloned().collect(),
         languages,
@@ -504,6 +698,10 @@ fn load_resolver(conn: &Connection, repo_id: &str) -> Result<(Resolver, RepoFact
             .iter()
             .map(|(path, bindings)| (path.clone(), build_import_aliases(bindings)))
             .collect(),
+        file_receivers,
+        func_receivers,
+        class_attr_types,
+        class_bases,
         defs: Vec::new(),
         module_cache: HashMap::new(),
         target_cache: HashMap::new(),
@@ -623,6 +821,7 @@ pub fn resolve_graph(conn: &mut Connection, repo_id: &str) -> Result<ResolveCoun
                 row.get(1)?,
                 row.get::<_, String>(2)?.trim().to_owned(),
                 Caller {
+                    id: row.get(1)?,
                     kind: row.get(3)?,
                     qname: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                     path: row.get(5)?,
@@ -758,6 +957,117 @@ fn filter_shadowed_rows(rows: Vec<WalkRow>) -> Vec<WalkRow> {
         .collect()
 }
 
+struct ImportFilter {
+    target_file_id: String,
+    target_path: String,
+    target_symbols: Vec<String>,
+    files: HashSet<String>,
+    languages: HashMap<String, String>,
+    importer_bindings: HashMap<String, Vec<ImportBinding>>,
+}
+
+impl ImportFilter {
+    fn load(
+        conn: &Connection,
+        repo_id: &str,
+        target_file_id: String,
+        target: &NodeRow,
+    ) -> Result<Self> {
+        let mut target_symbols = Vec::new();
+        if !target.name.is_empty() {
+            target_symbols.push(target.name.clone());
+        }
+        if target.kind == "Method"
+            && let Some((head, _)) = target.qname.rsplit_once('.')
+            && let Some(class_name) = head.rsplit('.').next()
+            && !class_name.is_empty()
+            && !target_symbols.iter().any(|s| s == class_name)
+        {
+            target_symbols.push(class_name.to_owned());
+        }
+        let languages: HashMap<String, String> = conn
+            .prepare("SELECT path, language FROM files WHERE repo_id = ?")?
+            .query_map([repo_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let files: HashSet<String> = languages.keys().cloned().collect();
+        let mut importer_bindings = HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT n.path, n.extra_json
+             FROM edges e
+             JOIN nodes n ON n.repo_id = e.repo_id AND n.id = e.src
+             WHERE e.repo_id = ? AND e.dst = ? AND e.kind = 'IMPORTS' AND n.kind = 'File'",
+        )?;
+        let rows = stmt.query_map(params![repo_id, &target_file_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?;
+        for row in rows {
+            let (path, extra) = row?;
+            if let Some(bindings) = parse_bindings(&decode_extra(&extra)) {
+                importer_bindings.insert(path, bindings);
+            }
+        }
+        Ok(Self {
+            target_file_id,
+            target_path: target.path.clone(),
+            target_symbols,
+            files,
+            languages,
+            importer_bindings,
+        })
+    }
+
+    fn resolve_module(&self, module: &str, importer: &str) -> Option<String> {
+        match self.languages.get(importer).map(String::as_str) {
+            Some("python") => resolve_python_module(module, importer, &self.files),
+            Some("typescript" | "javascript") => resolve_js_module(module, importer, &self.files),
+            _ => None,
+        }
+    }
+
+    /// True if `importer_path` imports `target_path` in a way that could reach `target_symbols`.
+    fn allows(&self, importer_path: &str) -> bool {
+        let Some(bindings) = self.importer_bindings.get(importer_path) else {
+            return true;
+        };
+        if bindings.is_empty() {
+            return true;
+        }
+        for binding in bindings {
+            if binding.module.is_empty() {
+                continue;
+            }
+            if let Some(name) = binding.name.as_deref()
+                && !matches!(name, "" | "*" | "default")
+            {
+                let joined = join_module_name(&binding.module, name);
+                if self.resolve_module(&joined, importer_path).as_deref()
+                    == Some(self.target_path.as_str())
+                {
+                    // `from pkg import target_mod` imports the whole target module.
+                    return true;
+                }
+            }
+            if self
+                .resolve_module(&binding.module, importer_path)
+                .as_deref()
+                != Some(self.target_path.as_str())
+            {
+                continue;
+            }
+            match binding.name.as_deref() {
+                None | Some("" | "*" | "default") => return true,
+                Some(name) if self.target_symbols.iter().any(|s| s == name) => return true,
+                Some(_) => {}
+            }
+        }
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn walk(
     conn: &Connection,
     repo_id: &str,
@@ -766,6 +1076,7 @@ fn walk(
     direction: &str,
     depth: Option<i64>,
     max_nodes: usize,
+    import_filter: Option<&ImportFilter>,
 ) -> Result<(Vec<Value>, bool)> {
     let mut stmt = conn.prepare_cached(sql)?;
     let mut visited: HashSet<String> = seeds.iter().map(|(id, _)| id.clone()).collect();
@@ -800,6 +1111,16 @@ fn walk(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for row in filter_shadowed_rows(rows) {
+            if let Some(filter) = import_filter
+                && distance == 0
+                && current == filter.target_file_id
+                && row.edge_kind == "IMPORTS"
+                && row.kind == "File"
+                && let Some(importer_path) = row.compact["path"].as_str()
+                && !filter.allows(importer_path)
+            {
+                continue;
+            }
             if !visited.insert(row.id.clone()) {
                 continue;
             }
@@ -817,7 +1138,12 @@ fn walk(
                 "confidence": combined,
                 "scope": edge_scope(&row.edge_kind),
             }));
-            if EXPANDABLE_NODE_KINDS.contains(&row.kind.as_str()) {
+            // For symbol targets (`import_filter.is_some()`), keep `IMPORTS` as a 1-hop
+            // `conservative_file` signal rather than cascading transitively across the whole
+            // file-import graph; multi-hop traversal continues along symbol edges (`CALLS`,
+            // `EXTENDS`, `HANDLES`, `CONTAINS`).
+            let expand_import = !(import_filter.is_some() && row.edge_kind == "IMPORTS");
+            if expand_import && EXPANDABLE_NODE_KINDS.contains(&row.kind.as_str()) {
                 queue.push_back((row.id, distance + 1, combined, row.qname));
             }
         }
@@ -850,6 +1176,7 @@ pub fn blast_radius(
         Some(existing) => existing.1 = qname.clone(),
         None => seeds.push((id, qname.clone())),
     };
+    let mut import_filter = None;
     if target.kind == "File" {
         let mut stmt = conn
             .prepare("SELECT dst FROM edges WHERE repo_id = ? AND src = ? AND kind = 'DEFINES'")?;
@@ -873,6 +1200,14 @@ pub fn blast_radius(
                 other => Err(other),
             })?;
         if let Some(file_id) = file_id {
+            if direction != Direction::Down {
+                import_filter = Some(ImportFilter::load(
+                    conn,
+                    &repo_id,
+                    file_id.clone(),
+                    &target,
+                )?);
+            }
             push_seed(&mut seeds_up, file_id);
         }
     }
@@ -891,6 +1226,7 @@ pub fn blast_radius(
             "up",
             depth_limit,
             max_nodes,
+            import_filter.as_ref(),
         )?
     } else {
         (Vec::new(), false)
@@ -904,6 +1240,7 @@ pub fn blast_radius(
             "down",
             depth_limit,
             max_nodes,
+            None,
         )?
     } else {
         (Vec::new(), false)

@@ -296,41 +296,71 @@ fn language_for(path: &Path) -> Option<&'static str> {
         .map(|(_, language)| *language)
 }
 
-/// Source files under `root`, skipping excluded and hidden directories and generated files.
+/// Source files under `root`, skipping excluded/hidden/gitignored paths and generated files.
 /// Sorted for a stable order; the Python walk uses directory order.
 pub fn iter_source_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut entries: Vec<_> = entries.filter_map(std::result::Result::ok).collect();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            let is_dir = file_type.is_dir() || (file_type.is_symlink() && path.is_dir());
-            if is_dir {
-                // os.walk does not descend into directory symlinks by default.
-                if !file_type.is_symlink()
-                    && !EXCLUDED_DIRS.contains(&name.as_str())
-                    && !name.starts_with('.')
-                {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if language_for(&path).is_some() && !is_probably_generated(&path) {
-                out.push(path);
-            }
-        }
+    let mut ignores = Vec::new();
+    if let Some(exclude) =
+        crate::gitignore::IgnoreFile::from_path(&root.join(".git/info/exclude"), "")
+    {
+        ignores.push(exclude);
     }
+    walk_source_dir(root, "", &mut ignores, &mut out);
     out.sort();
     out
+}
+
+fn walk_source_dir(
+    dir: &Path,
+    dir_rel: &str,
+    ignores: &mut Vec<crate::gitignore::IgnoreFile>,
+    out: &mut Vec<PathBuf>,
+) {
+    let pushed = crate::gitignore::IgnoreFile::from_path(&dir.join(".gitignore"), dir_rel)
+        .map(|file| ignores.push(file))
+        .is_some();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        if pushed {
+            ignores.pop();
+        }
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(std::result::Result::ok).collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let rel = if dir_rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{dir_rel}/{name}")
+        };
+        let is_dir = file_type.is_dir() || (file_type.is_symlink() && path.is_dir());
+        if is_dir {
+            // os.walk does not descend into directory symlinks by default.
+            if !file_type.is_symlink()
+                && !EXCLUDED_DIRS.contains(&name.as_str())
+                && !name.starts_with('.')
+                && !crate::gitignore::is_ignored(ignores, &rel, true)
+            {
+                walk_source_dir(&path, &rel, ignores, out);
+            }
+            continue;
+        }
+        if language_for(&path).is_some()
+            && !crate::gitignore::is_ignored(ignores, &rel, false)
+            && !is_probably_generated(&path)
+        {
+            out.push(path);
+        }
+    }
+    if pushed {
+        ignores.pop();
+    }
 }
 
 pub fn is_probably_generated(path: &Path) -> bool {
@@ -396,6 +426,11 @@ pub fn parse_file(
             .extra
             .insert("imports".into(), Value::Array(parsed.imports));
     }
+    if !parsed.receivers.is_empty() {
+        file_node
+            .extra
+            .insert("receivers".into(), Value::Object(parsed.receivers));
+    }
     let mut nodes = vec![file_node];
     nodes.extend(parsed.nodes);
     FileIndex {
@@ -417,6 +452,7 @@ pub struct Parsed {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub imports: Vec<Value>,
+    pub receivers: serde_json::Map<String, Value>,
 }
 
 /// `Path(rel).with_suffix("")` with `/` turned into `.`.
@@ -564,6 +600,9 @@ pub fn parse_python(rel: &str, text: &str, file_id: &str) -> Parsed {
         }
     };
     let lines = splitlines(text);
+    for (key, value) in pyast::collect_module_receivers(&tree.body) {
+        out.receivers.insert(key, Value::String(value));
+    }
     let mut symbols: HashMap<String, String> = HashMap::new();
     for item in &tree.body {
         match item {
@@ -748,7 +787,7 @@ fn python_function_node(
     let span = tree.stmt_lines(stmt);
     let doc = pyast::docstring(&def.body);
     let body = slice_lines(lines, span.0, span.1);
-    let node = node_with(
+    let mut node = node_with(
         kind,
         name,
         &format!("{prefix}.{name}"),
@@ -762,6 +801,14 @@ fn python_function_node(
             ..NodeAttrs::default()
         },
     );
+    let receivers = pyast::collect_function_receivers(def);
+    if !receivers.is_empty() {
+        let map: serde_json::Map<String, Value> = receivers
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
+        node.extra.insert("receivers".into(), Value::Object(map));
+    }
     with_fts_body(node, &body)
 }
 
@@ -788,7 +835,7 @@ fn python_class_node(
     let span = tree.stmt_lines(stmt);
     let doc = pyast::docstring(&class.body);
     let body = slice_lines(lines, span.0, span.1);
-    let node = node_with(
+    let mut node = node_with(
         "Class",
         name,
         &format!("{module}.{name}"),
@@ -802,6 +849,14 @@ fn python_class_node(
             ..NodeAttrs::default()
         },
     );
+    let attr_types = pyast::collect_class_attr_types(class);
+    if !attr_types.is_empty() {
+        let map: serde_json::Map<String, Value> = attr_types
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
+        node.extra.insert("attr_types".into(), Value::Object(map));
+    }
     with_fts_body(node, &body)
 }
 
@@ -1225,7 +1280,7 @@ pub fn parse_config(rel: &str, text: &str, file_id: &str, language: &str) -> Par
     Parsed {
         edges: vec![Edge::new(file_id, &node.id, "CONTAINS", "exact", "")],
         nodes: vec![node],
-        imports: Vec::new(),
+        ..Parsed::default()
     }
 }
 
