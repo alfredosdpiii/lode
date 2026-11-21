@@ -1,66 +1,49 @@
 # Lode
 
-Lode is a fast, local-first codebase map for coding agents.
+Lode is a fast, local-first codebase map for coding agents, written in Rust.
 
-It indexes source files into SQLite for cheap per-turn lookup, and can project
-the same facts into embedded Kuzu for graph traversal. It answers: where is this
-symbol, what should I read, what calls this, and what might break if I touch it,
-without sending the repo to a hosted code-search service.
+It indexes source files into bundled SQLite + FTS5 for cheap per-turn lookup. It answers: where is this symbol, what should I read, what calls this, and what might break if I touch it — without sending the repo to a hosted code-search service.
 
 [![Watch the Lode overview video](docs/assets/lode-overview-poster.png)](https://app.factory.ai/wiki/a71cbea2-853d-40f7-a479-f1e8d6af8252)
 
-Watch the generated overview video in the
-[Factory wiki](https://app.factory.ai/wiki/a71cbea2-853d-40f7-a479-f1e8d6af8252).
-
-The generated docs are also mirrored to the GitHub wiki:
-https://github.com/alfredosdpiii/lode/wiki
-
 ## Goals
 
-- Local by default: no account, hosted index, or remote API call required.
-- CLI first: agents can call `lode` directly and get bounded JSON with file:line citations.
-- Fast path in SQLite: exact lookup and FTS stay cheap enough for per-turn use.
-- Optional graph path in Kuzu: Cypher and vector experiments without leaving local disk.
-- Daemon-friendly: run `loded` on login if you want a warm local service.
+- **Local by default**: single native binary, bundled SQLite, no account or hosted API required.
+- **CLI first**: agents call `lode` directly and get bounded JSON with `path:line` citations.
+- **Fast hot path**: ~3 ms context retrieval and sub-second indexing on typical repos.
+- **Daemon-friendly**: run `loded` when you want a warm local HTTP service.
 
-## Current state
+## Features
 
-This is an early MVP. Today it can:
-
-- `lode index PATH` for Python, TypeScript/JavaScript, Markdown, and config-ish files.
-- `lode search QUERY --json` over SQLite FTS5.
-- `lode symbol NAME --json` for exact-ish symbol lookup.
-- `lode context QUERY --json --budget N` for an agent context pack.
-- `lode impact TARGET --json` for callers, callees, full reachable blast radius, and affected entrypoints.
+- `lode index PATH` for Python (`ruff_python_parser`), TypeScript/JavaScript, Markdown, and config files (respects `.gitignore` and `.git/info/exclude`).
+- `lode search QUERY --json` over SQLite FTS5 with weighted BM25.
+- `lode symbol NAME --json` for exact/partial symbol lookup.
+- `lode context QUERY --json --budget N` for a token-budgeted agent context pack.
+- `lode impact TARGET --json` for callers, callees, receiver-aware call resolution, import-filtered blast radius, and affected `Route` entrypoints.
 - `lode neighbors NODE_ID --json` for direct graph neighbors.
-- `loded` local HTTP daemon with `/health`, `/status`, `/index`, `/search`, and `/context`.
-- Optional Kuzu projection code when the `kuzu` extra is installed.
-- Docker Compose with a local TEI embeddings service using `Snowflake/snowflake-arctic-embed-s`.
+- `loded` local HTTP daemon with `/health`, `/status`, `/index`, `/search`, `/context`, and `/metrics`.
+- `lode embed` for optional local embeddings services (loopback or Docker `embeddings` host only).
+- Optional `--features embed` Cargo feature for a local CPU reranker (`lode context --rerank`, off by default).
 
-## Install
+## Install & Build
 
-The PyPI package is called `lode-kg`; it installs the `lode` CLI and `loded` daemon.
+Requires Rust 1.85+:
 
 ```bash
-uv tool install lode-kg
+cargo install --path .
 lode --help
 ```
 
-Or install with the optional embedded Kuzu projection support:
+Or build release binaries directly:
 
 ```bash
-uv tool install 'lode-kg[kuzu]'
+cargo build --release --bins
+./target/release/lode --help
 ```
 
 ### Install the agent skill
 
-This repo also ships a reusable coding-agent skill at `skills/lode/`. The skill
-is not the CLI; it is the short instruction pack that tells an agent when to
-reach for `lode index`, `lode search`, `lode symbol`, `lode context`, and
-`lode impact` during codebase work.
-
-Install it into any coding agent that supports skill or instruction-pack
-directories:
+This repo ships a reusable coding-agent skill at `skills/lode/`:
 
 ```bash
 AGENT_SKILLS_DIR="/path/to/your/agent/skills"
@@ -68,40 +51,13 @@ mkdir -p "$AGENT_SKILLS_DIR/lode"
 cp -R skills/lode/. "$AGENT_SKILLS_DIR/lode/"
 ```
 
-Common destinations include:
-
-```bash
-# Factory Droid
-AGENT_SKILLS_DIR="$HOME/.factory/skills"
-
-# Pi
-AGENT_SKILLS_DIR="$HOME/.pi/agent/skills"
-
-# Project-local agents
-AGENT_SKILLS_DIR="$PWD/.agents/skills"
-```
-
-Or install it only for this project:
-
-```bash
-mkdir -p .agents/skills/lode
-cp -R skills/lode/. .agents/skills/lode/
-```
-
-Then reload or restart your agent so its skill registry picks up the new
-directory. Agents with explicit skill commands may also let you force-load it as
-`lode`; otherwise the agent should pick it up when a task calls for local repo
-search, symbol lookup, impact checks, graph neighbors, or a bounded context pack.
-
-Review `skills/lode/SKILL.md` before installing it from any checkout you do not
-trust. Skills are instructions to your agent, not inert docs.
-
 ## Quick start
 
 ```bash
 lode index ~/Projects/lode
 lode search "knowledge graph" --json
 lode context "how does indexing work" --json --budget 4000
+lode impact blast_radius --json
 ```
 
 Run the local daemon:
@@ -117,167 +73,56 @@ docker compose up -d --build
 curl http://127.0.0.1:7979/health
 ```
 
-The `loded` container runs as `${LODE_UID:-1000}:${LODE_GID:-1000}` so the host
-CLI can still write the SQLite file. If your user is not UID/GID 1000, export
-`LODE_UID=$(id -u)` and `LODE_GID=$(id -g)` first.
-
-Index a mounted repo through the daemon:
-
-```bash
-curl -sS -X POST http://127.0.0.1:7979/index \
-  -H 'content-type: application/json' \
-  -d '{"path":"/repos/lode"}' | jq
-```
-
-## Architecture
-
-```text
-agent / human
-    |
-  lode CLI
-    |
-localhost HTTP or direct DB
-    |
-  loded daemon
-    |--------------------------|
-    | scanner / parser         |
-    | resolver                 |
-    | context pack builder     |
-    | embedding queue          |
-    | Kuzu projector           |
-    |--------------------------|
-       |                   |
- SQLite hot index       Kuzu graph DB
-       |                   |
-       +---- fact projection ----+
-               |
-        TEI embeddings service
-```
-
-SQLite handles the lookups an agent needs during a turn. Kuzu is for graph and
-Cypher work. Longer term, facts should be append-only and replayable so both
-projections can be rebuilt from the same log.
-
 ## CLI commands
 
 ```bash
-lode index PATH [--data-dir DIR] [--sync-kuzu]
+lode index PATH [--data-dir DIR]
 lode status [--json]
 lode search QUERY [--repo PATH] [--limit N] [--json]
 lode symbol NAME [--repo PATH] [--limit N] [--json]
-lode context QUERY [--repo PATH] [--budget N] [--json]
+lode context QUERY [--repo PATH] [--budget N] [--from-path PATH] [--json]
 lode impact TARGET [--repo PATH] [--limit N] [--neighbor-limit N] [--depth N] [--max-nodes N] [--direction up|down|both] [--json]
 lode neighbors NODE_ID [--json]
-lode kuzu-sync
 lode embed [--limit N] [--url URL] [--model MODEL] [--json]
 lode serve --host 127.0.0.1 --port 7979
 ```
 
-`kg` and `kgd` are temporary aliases for `lode` and `loded`.
-
 ## Storage layout
 
-Default data directory:
+Default data directory (`LODE_DATA_DIR`, `KG_DATA_DIR`, or `~/.local/share/lode`):
 
 ```text
 ~/.local/share/lode/
   lode.sqlite
-  lode.kuzu/
 ```
-
-## Embeddings
-
-Docker Compose starts Hugging Face Text Embeddings Inference with
-`Snowflake/snowflake-arctic-embed-s`. It exposes `/embed` on `127.0.0.1:7980`
-for local smoke tests and wires the daemon with
-`LODE_EMBEDDINGS_URL=http://embeddings:80`. Embeddings are optional; exact search
-and graph links should still carry the tool when no model is running.
-
-Model choice: `snowflake-arctic-embed-s` is the strongest 33M-parameter /
-384-dimension small English retrieval model in the comparison set I used, with
-MTEB retrieval NDCG@10 of 51.98 versus 51.68 for `BAAI/bge-small-en-v1.5`. It
-also has ONNX artifacts and passed a TEI CPU `/embed` smoke test.
-
-Embed queued nodes after indexing:
-
-```bash
-docker compose up -d embeddings
-LODE_EMBEDDINGS_URL=http://127.0.0.1:7980 \
-  LODE_EMBEDDINGS_MODEL=Snowflake/snowflake-arctic-embed-s \
-  uv run lode embed --limit 32 --json
-```
-
-`Qwen/Qwen3-Embedding-0.6B` was tested first, but it is a bad TEI CPU default
-here: the container downloads the model, reports missing ONNX artifacts, falls
-back to Candle CPU warmup, and restarts before `/embed` serves.
-`BAAI/bge-small-en-v1.5` works. `Snowflake/snowflake-arctic-embed-s` is the
-current small-model default because it is in the same size class and scored a bit
-better in the benchmark data I checked.
 
 ## Benchmarks
 
-Final gate run: 2026-06-16 on an AMD Ryzen 9 8945HS, 16 logical cores, Python
-3.13.9. The final evidence passed 78/78 validation assertions. The key numbers
-are the SQLite hot-path timings, because those are what an agent uses inside a
-normal turn. Kuzu sync is a batch/analytics projection.
+### RepoBench-R retrieval (300/bucket, merged paths, 5 query lines)
 
-| Workload | Files | Nodes | Edges | Cold index | Hot re-index | Search p50 | Symbol p50 | Context p50 | Neighbor p50 | Kuzu sync | Embeddings |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Lode repo | 47 | 2,358 | 5,112 | 154.391 ms | 2.896 ms | 0.267 ms | 0.064 ms | 0.346 ms | 0.402 ms | 213.744 ms | 32 @ 31.655/s, 384d |
+| Split | Bucket | Hit@1 | Hit@3 | Hit@5 | Hit@10 | MRR | Median ret |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `cross_file_first` | lt5 | 0.423 | 0.930 | 0.983 | 0.983 | 0.667 | 3.06 ms |
+| `cross_file_first` | easy | 0.257 | 0.620 | 0.857 | 0.997 | 0.486 | 3.48 ms |
+| `cross_file_first` | hard | 0.213 | 0.423 | 0.563 | 0.837 | 0.383 | 3.58 ms |
+| `cross_file_random` | lt5 | 0.580 | 0.953 | 0.987 | 0.987 | 0.767 | 3.06 ms |
+| `cross_file_random` | easy | 0.413 | 0.750 | 0.920 | 0.990 | 0.609 | 3.13 ms |
+| `cross_file_random` | hard | 0.280 | 0.547 | 0.690 | 0.897 | 0.459 | 3.43 ms |
 
-For RepoBench-style retrieval, Lode was evaluated on all Python v1.1 cross-file
-rows from
-[`tianyang/repobench_python_v1.1`](https://huggingface.co/datasets/tianyang/repobench_python_v1.1).
-The run uses `context` mode, `--query-lines 5`, `--search-limit 30`,
-`--context-budget 6000`, and reports retrieval only: did Lode rank the gold
-cross-file snippet path high enough? It does not score code generation.
+### Blast radius & call resolution
 
-Final gate artifacts were preserved in the mission evidence bundle. Fifteen rows
-were skipped because `gold_snippet_index` pointed outside the provided context
-list.
-
-| Split | Samples | Skipped | Mean retrieval | Hit@1 | Hit@3 | Hit@5 | Hit@10 | MRR |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `cross_file_first` | 8,026 | 7 | 0.858 ms | 0.250436 | 0.596935 | 0.730002 | 0.843633 | 0.451728 |
-| `cross_file_random` | 7,610 | 8 | 0.869 ms | 0.368725 | 0.645466 | 0.753876 | 0.854271 | 0.532594 |
-| Combined | 15,636 | 15 | 0.863 ms | 0.308007 | 0.620555 | 0.741622 | 0.848810 | 0.491085 |
-
-[RepoBench](https://openreview.net/forum?id=pPjZIOuQuF) is an ICLR 2024 benchmark
-for repository-level code completion. There is no official Python v1.1
-leaderboard here, so comparisons against the original RepoBench-R paper table
-are directional only. The simple read: Lode is strongest on the hard retrieval
-slices, where it is top-3 on the Hit@1/Hit@3 checks against those older paper
-baselines. Easy-slice results are mixed, so do not read this as an overall
-leaderboard rank.
-
-Lode includes two benchmark entrypoints:
+Run the ground-truth precision/recall eval and real-repo audit:
 
 ```bash
-# Local operational benchmark: cold/hot index, search, symbols, context, graph, optional Kuzu
-uv run python scripts/bench_lode.py --repo . --include-kuzu --json
-
-# If TEI is running locally, include embedding throughput/persistence
-docker compose up -d embeddings
-uv run python scripts/bench_lode.py --repo . --embed-url http://127.0.0.1:7980 --json
+python3 scripts/blast_radius_eval.py
 ```
 
-For RepoBench-style retrieval quality, export a RepoBench split to JSONL and run the adapter:
+## Validation
 
 ```bash
-# Expected fields match tianyang/repobench_python_v1.1: context, cropped_code, file_path, gold_snippet_index
-uv run python benchmarks/repobench_adapter.py --input repobench_cross_file_first.jsonl --limit 100 --json
-```
-
-The adapter turns each sample into a tiny repository, then reports `hit_at_k` and
-MRR for the gold cross-file snippet path. It is a retrieval benchmark, not a
-code-generation benchmark.
-
-Run the full end-of-mission gate for quality checks, local-first assertions,
-benchmark comparison, Kuzu and embeddings validation, RepoBench adapter
-diagnostics, and CLI/API compatibility assertions:
-
-```bash
-uv run python scripts/final_quality_gate.py
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
 ## License

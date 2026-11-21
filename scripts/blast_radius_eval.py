@@ -17,8 +17,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BIN = ROOT / "rust" / "target" / "debug" / "lode"
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BIN = ROOT / "target" / "debug" / "lode"
 
 
 def run_lode(binary: Path, data_dir: Path, *args: str) -> dict:
