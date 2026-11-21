@@ -139,9 +139,7 @@ def eval_ground_truth(binary: Path) -> dict:
         {
             "name": "inherited_method_call",
             "files": {
-                "base.py": (
-                    "class Base:\n    def execute(self):\n        return 1\n"
-                ),
+                "base.py": ("class Base:\n    def execute(self):\n        return 1\n"),
                 "other.py": (
                     "class Other:\n    def execute(self):\n        return 2\n"
                 ),
@@ -225,10 +223,7 @@ def eval_ground_truth(binary: Path) -> dict:
             "name": "false_positive_unknown_receiver",
             "files": {
                 "buf.py": "class Buffer:\n    def flush(self):\n        return 1\n",
-                "io_mod.py": (
-                    "def write_out(stream):\n"
-                    "    stream.flush()\n"
-                ),
+                "io_mod.py": ("def write_out(stream):\n    stream.flush()\n"),
             },
             "expected_calls": set(),
             "forbidden_calls": {("io_mod.write_out", "buf.Buffer.flush")},
@@ -249,16 +244,19 @@ def eval_ground_truth(binary: Path) -> dict:
                     "def run_b():\n    return helper_b()\n"
                 ),
                 "uses_mod.py": (
-                    "import utils\n\n"
-                    "def run_mod():\n    return utils.helper_b()\n"
+                    "import utils\n\ndef run_mod():\n    return utils.helper_b()\n"
                 ),
                 "uses_star.py": (
-                    "from utils import *\n\n"
-                    "def run_star():\n    return helper_b()\n"
+                    "from utils import *\n\ndef run_star():\n    return helper_b()\n"
                 ),
             },
             "blast_target": "helper_b",
-            "expected_blast_files": {"utils.py", "uses_b.py", "uses_mod.py", "uses_star.py"},
+            "expected_blast_files": {
+                "utils.py",
+                "uses_b.py",
+                "uses_mod.py",
+                "uses_star.py",
+            },
             "forbidden_blast_files": {"uses_a.py"},
         },
     ]
@@ -296,7 +294,13 @@ def eval_ground_truth(binary: Path) -> dict:
 
             if "blast_target" in case:
                 impact = run_lode(
-                    binary, data, "impact", case["blast_target"], "--repo", str(repo), "--json"
+                    binary,
+                    data,
+                    "impact",
+                    case["blast_target"],
+                    "--repo",
+                    str(repo),
+                    "--json",
                 )
                 files = set(impact["results"][0]["files"])
                 exp_f = case["expected_blast_files"]
@@ -321,7 +325,14 @@ def eval_ground_truth(binary: Path) -> dict:
         prec = t / (t + f_p) if (t + f_p) else 1.0
         rec = t / (t + f_n) if (t + f_n) else 1.0
         f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
-        return {"tp": t, "fp": f_p, "fn": f_n, "precision": round(prec, 4), "recall": round(rec, 4), "f1": round(f1, 4)}
+        return {
+            "tp": t,
+            "fp": f_p,
+            "fn": f_n,
+            "precision": round(prec, 4),
+            "recall": round(rec, 4),
+            "f1": round(f1, 4),
+        }
 
     return {
         "cases_passed": sum(1 for d in details if d["passed"]),
@@ -338,7 +349,9 @@ def eval_real_repo(binary: Path, repo: Path) -> dict:
         stats = run_lode(binary, data, "index", str(repo), "--json")
         db = sqlite3.connect(str(data / "lode.sqlite"))
 
-        total_call_edges = db.execute("SELECT COUNT(*) FROM edges WHERE kind = 'CALLS'").fetchone()[0]
+        total_call_edges = db.execute(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'CALLS'"
+        ).fetchone()[0]
         resolved_calls = db.execute(
             "SELECT COUNT(*) FROM edges WHERE kind = 'CALLS' AND confidence IN ('strong', 'resolved')"
         ).fetchone()[0]
@@ -372,7 +385,9 @@ def eval_real_repo(binary: Path, repo: Path) -> dict:
             """
         ).fetchall()
         langs = dict(
-            db.execute("SELECT language, COUNT(*) FROM files GROUP BY language").fetchall()
+            db.execute(
+                "SELECT language, COUNT(*) FROM files GROUP BY language"
+            ).fetchall()
         )
         db.close()
 
@@ -380,7 +395,9 @@ def eval_real_repo(binary: Path, repo: Path) -> dict:
         file_counts = []
         conservative_counts = []
         for node_id, _qname, _path in symbols:
-            rep = run_lode(binary, data, "impact", node_id, "--repo", str(repo), "--json")
+            rep = run_lode(
+                binary, data, "impact", node_id, "--repo", str(repo), "--json"
+            )
             res = rep["results"][0]
             br = res["blast_radius"]
             upstream_counts.append(br["stats"]["upstream"])
